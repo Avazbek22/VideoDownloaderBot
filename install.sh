@@ -12,7 +12,7 @@ set -euo pipefail
 # =========================
 
 REPO_URL_DEFAULT="https://github.com/Avazbek22/VideoDownloaderBot.git"
-BRANCH_DEFAULT="master"
+BRANCH_DEFAULT="main"
 INSTALL_DIR_DEFAULT="$HOME/VideoDownloaderBot"
 
 MAX_FILE_MB=50
