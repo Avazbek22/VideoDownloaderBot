@@ -967,7 +967,7 @@ def start_help(message):
         "• *Document* (original file)\n"
         "• *Audio (MP3)*\n\n"
         f"Upload limit: *{_fmt_bytes(MAX_SEND_BYTES)}*\n\n"
-        "_Powered by_ [yt-dlp](https://github.com/yt-dlp/yt-dlp/)",
+        "_Powered by_ [Avazbek Olimov](https://github.com/Avazbek22/VideoDownloaderBot)",
         parse_mode="MARKDOWN",
         disable_web_page_preview=True,
     )
