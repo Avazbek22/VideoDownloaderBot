@@ -95,7 +95,7 @@ install_base_deps() {
   say "Installing system dependencies (python3, venv, pip, git, ffmpeg)..."
   as_root apt-get update -y
   as_root apt-get install -y --no-install-recommends \
-    ca-certificates curl git python3 python3-venv python3-pip ffmpeg
+    ca-certificates curl git python3 python3-venv python3-pip ffmpeg nodejs
   ok "FFmpeg installed. Codecs are included in Ubuntu's ffmpeg build."
 }
 
@@ -128,8 +128,11 @@ BOT_TOKEN=$token
 OUTPUT_FOLDER=/tmp/yt-dlp-telegram
 EOF
 
-  # Keep config.py minimal: only reads env; logs=None; max_filesize fixed to 50MB
-  cat > "$install_dir/config.py" <<'PY'
+  if [[ -f "$install_dir/config.py" ]]; then
+    warn "config.py already exists; leaving it unchanged."
+  else
+    # Keep config.py minimal: only reads env; logs=None; max_filesize fixed to 50MB
+    cat > "$install_dir/config.py" <<'PY'
 import os
 
 # Required
@@ -146,6 +149,7 @@ max_filesize = 50 * 1024 * 1024
 # Temp folder for downloads (can be overridden)
 output_folder = (os.getenv("OUTPUT_FOLDER") or "/tmp/yt-dlp-telegram").strip() or "/tmp/yt-dlp-telegram"
 PY
+  fi
 
   # Make sure token file isn't accidentally committed (best effort)
   if [[ -f "$install_dir/.gitignore" ]]; then
@@ -267,11 +271,12 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
-      ffmpeg ca-certificates \
+      ffmpeg ca-certificates nodejs procps \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -U yt-dlp
 
 COPY . /app
 RUN chmod +x /app/docker/entrypoint.sh
@@ -317,6 +322,7 @@ install_system_mode() {
   python3 -m venv "$install_dir/.venv"
   "$install_dir/.venv/bin/pip" install --upgrade pip >/dev/null 2>&1 || true
   "$install_dir/.venv/bin/pip" install -r "$install_dir/requirements.txt"
+  "$install_dir/.venv/bin/pip" install -U yt-dlp
 
   ok "Python venv ready."
 
