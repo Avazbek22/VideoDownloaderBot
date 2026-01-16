@@ -145,6 +145,13 @@ def _is_youtube_url(url: str) -> bool:
     return host.endswith(".youtube.com") or host.endswith("youtube-nocookie.com")
 
 
+def _youtube_ydl_opts() -> Dict[str, Any]:
+    return {
+        "js_runtimes": ["node"],
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+
+
 def _extract_first_url(text: str) -> Optional[str]:
     if not text:
         return None
@@ -342,8 +349,7 @@ def _probe_url_size_bytes(url: str, timeout_sec: int = 10) -> Optional[int]:
 def _get_video_meta(url: str) -> Dict[str, Any]:
     ydl_opts: Dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
     if _is_youtube_url(url):
-        ydl_opts["js_runtimes"] = ["node"]
-        ydl_opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+        ydl_opts.update(_youtube_ydl_opts())
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -755,11 +761,7 @@ def _cleanup_tmp_files(prefix: str) -> None:
 def _youtube_format_candidates(initial_format: str) -> List[str]:
     candidates = [
         initial_format,
-        "bv*[ext=mp4][vcodec^=avc1][height<=1080]+ba[ext=m4a]/b[ext=mp4][height<=1080]/bv*+ba/b",
-        "bv*[ext=mp4][vcodec^=avc1][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/bv*+ba/b",
-        "bv*[ext=mp4][vcodec^=avc1][height<=480]+ba[ext=m4a]/b[ext=mp4][height<=480]/bv*+ba/b",
-        "bv*+ba/b",
-        "b",
+        "b[ext=mp4]/b",
     ]
     seen = set()
     ordered: List[str] = []
@@ -828,6 +830,8 @@ def _download_and_send(job: Dict[str, Any]) -> None:
 
     is_youtube = _is_youtube_url(url)
     format_spec = str(plan.get("format_spec", "best"))
+    if is_youtube and mode != "audio":
+        format_spec = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
     format_candidates = _youtube_format_candidates(format_spec) if (is_youtube and mode != "audio") else [format_spec]
 
     info: Dict[str, Any] = {}
@@ -873,8 +877,7 @@ def _download_and_send(job: Dict[str, Any]) -> None:
                 ydl_opts["max_filesize"] = MAX_SEND_BYTES
 
             if is_youtube:
-                ydl_opts["js_runtimes"] = ["node"]
-                ydl_opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+                ydl_opts.update(_youtube_ydl_opts())
                 if mode != "audio":
                     ydl_opts["merge_output_format"] = "mp4"
             elif plan.get("merge_output_format"):
@@ -896,7 +899,9 @@ def _download_and_send(job: Dict[str, Any]) -> None:
                 _cleanup_tmp_files(attempt_prefix)
                 if not is_youtube:
                     raise
-                continue
+                if attempt_idx == 1 and "downloaded file is empty" in str(e).lower():
+                    continue
+                raise
 
             if _is_cancelled(job_id):
                 _safe_delete(chat_id, status_message_id)
@@ -912,7 +917,7 @@ def _download_and_send(job: Dict[str, Any]) -> None:
                 _cleanup_tmp_files(attempt_prefix)
                 if not is_youtube:
                     raise last_error
-                continue
+                raise last_error
 
             final_size = os.path.getsize(file_path)
             if final_size == 0:
@@ -921,7 +926,9 @@ def _download_and_send(job: Dict[str, Any]) -> None:
                 file_path = None
                 if not is_youtube:
                     raise last_error
-                continue
+                if attempt_idx == 1:
+                    continue
+                raise last_error
 
             if final_size > MAX_SEND_BYTES and mode != "audio":
                 last_error = RuntimeError(
@@ -929,9 +936,7 @@ def _download_and_send(job: Dict[str, Any]) -> None:
                 )
                 _cleanup_tmp_files(attempt_prefix)
                 file_path = None
-                if not is_youtube:
-                    raise last_error
-                continue
+                raise last_error
 
             break
 
