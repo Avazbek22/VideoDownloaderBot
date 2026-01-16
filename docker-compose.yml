@@ -1,0 +1,7 @@
+services:
+  videodownloaderbot:
+    build: .
+    container_name: videodownloaderbot
+    restart: unless-stopped
+    env_file:
+      - .env

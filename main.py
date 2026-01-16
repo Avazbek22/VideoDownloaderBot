@@ -133,6 +133,18 @@ def youtube_url_validation(url: str):
     return re.match(youtube_regex, url)
 
 
+def _is_youtube_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).netloc or "").lower()
+        host = host.split(":")[0]
+    except Exception:
+        return False
+
+    if host in ("youtu.be", "youtube.com", "www.youtube.com", "m.youtube.com"):
+        return True
+    return host.endswith(".youtube.com") or host.endswith("youtube-nocookie.com")
+
+
 def _extract_first_url(text: str) -> Optional[str]:
     if not text:
         return None
@@ -328,7 +340,12 @@ def _probe_url_size_bytes(url: str, timeout_sec: int = 10) -> Optional[int]:
 # yt-dlp meta fetch
 # =========================
 def _get_video_meta(url: str) -> Dict[str, Any]:
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
+    ydl_opts: Dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    if _is_youtube_url(url):
+        ydl_opts["js_runtimes"] = ["node"]
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -724,6 +741,35 @@ def _find_downloaded_file(info: Dict[str, Any], fallback_prefix: str, prefer_ext
     return _find_file_by_prefix(fallback_prefix, prefer_ext=prefer_ext)
 
 
+def _cleanup_tmp_files(prefix: str) -> None:
+    try:
+        for fn in os.listdir(config.output_folder):
+            if fn.startswith(prefix):
+                fp = os.path.join(config.output_folder, fn)
+                if os.path.exists(fp):
+                    os.remove(fp)
+    except Exception:
+        pass
+
+
+def _youtube_format_candidates(initial_format: str) -> List[str]:
+    candidates = [
+        initial_format,
+        "bv*[ext=mp4][vcodec^=avc1][height<=1080]+ba[ext=m4a]/b[ext=mp4][height<=1080]/bv*+ba/b",
+        "bv*[ext=mp4][vcodec^=avc1][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/bv*+ba/b",
+        "bv*[ext=mp4][vcodec^=avc1][height<=480]+ba[ext=m4a]/b[ext=mp4][height<=480]/bv*+ba/b",
+        "bv*+ba/b",
+        "b",
+    ]
+    seen = set()
+    ordered: List[str] = []
+    for fmt in candidates:
+        if fmt and fmt not in seen:
+            ordered.append(fmt)
+            seen.add(fmt)
+    return ordered
+
+
 # =========================
 # Worker: download + send
 # =========================
@@ -740,7 +786,7 @@ def _download_and_send(job: Dict[str, Any]) -> None:
     os.makedirs(config.output_folder, exist_ok=True)
 
     tmp_id = str(round(time.time() * 1000))
-    outtmpl = f"{config.output_folder}/{tmp_id}.%(ext)s"
+    base_prefix = tmp_id
 
     progress_state: Dict[str, Any] = {"pct": 0}
 
@@ -780,33 +826,13 @@ def _download_and_send(job: Dict[str, Any]) -> None:
                 force=True
             )
 
-    ydl_opts: Dict[str, Any] = {
-        "format": str(plan.get("format_spec", "best")),
-        "outtmpl": outtmpl,
-        "progress_hooks": [progress_hook],
-        "max_filesize": MAX_SEND_BYTES,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "concurrent_fragment_downloads": YTDLP_CONCURRENT_FRAGMENTS,
-        "retries": 5,
-        "fragment_retries": 5,
-        "socket_timeout": 20,
-    }
-
-    if plan.get("merge_output_format"):
-        ydl_opts["merge_output_format"] = str(plan["merge_output_format"])
-
-    if mode == "audio":
-        mp3_kbps = int(plan.get("mp3_kbps", 128))
-        ydl_opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": str(mp3_kbps),
-        }]
+    is_youtube = _is_youtube_url(url)
+    format_spec = str(plan.get("format_spec", "best"))
+    format_candidates = _youtube_format_candidates(format_spec) if (is_youtube and mode != "audio") else [format_spec]
 
     info: Dict[str, Any] = {}
     file_path: Optional[str] = None
+    last_error: Optional[Exception] = None
 
     try:
         if _is_cancelled(job_id):
@@ -821,27 +847,100 @@ def _download_and_send(job: Dict[str, Any]) -> None:
             force=True
         )
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        for attempt_idx, attempt_format in enumerate(format_candidates, start=1):
+            if _is_cancelled(job_id):
+                _safe_delete(chat_id, status_message_id)
+                return
 
-        if _is_cancelled(job_id):
-            _safe_delete(chat_id, status_message_id)
-            return
+            attempt_prefix = f"{base_prefix}-{attempt_idx}"
+            outtmpl = f"{config.output_folder}/{attempt_prefix}.%(ext)s"
+            _cleanup_tmp_files(attempt_prefix)
 
-        prefer_ext = ".mp3" if mode == "audio" else None
-        file_path = _find_downloaded_file(info, tmp_id, prefer_ext=prefer_ext)
+            ydl_opts: Dict[str, Any] = {
+                "format": attempt_format,
+                "outtmpl": outtmpl,
+                "progress_hooks": [progress_hook],
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "concurrent_fragment_downloads": YTDLP_CONCURRENT_FRAGMENTS,
+                "retries": 5,
+                "fragment_retries": 5,
+                "socket_timeout": 20,
+            }
+
+            if not is_youtube:
+                ydl_opts["max_filesize"] = MAX_SEND_BYTES
+
+            if is_youtube:
+                ydl_opts["js_runtimes"] = ["node"]
+                ydl_opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+                if mode != "audio":
+                    ydl_opts["merge_output_format"] = "mp4"
+            elif plan.get("merge_output_format"):
+                ydl_opts["merge_output_format"] = str(plan["merge_output_format"])
+
+            if mode == "audio":
+                mp3_kbps = int(plan.get("mp3_kbps", 128))
+                ydl_opts["postprocessors"] = [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": str(mp3_kbps),
+                }]
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+            except Exception as e:
+                last_error = e
+                _cleanup_tmp_files(attempt_prefix)
+                if not is_youtube:
+                    raise
+                continue
+
+            if _is_cancelled(job_id):
+                _safe_delete(chat_id, status_message_id)
+                return
+
+            prefer_ext = ".mp3" if mode == "audio" else None
+            file_path = _find_downloaded_file(info, attempt_prefix, prefer_ext=prefer_ext)
+            if not file_path:
+                file_path = _find_file_by_prefix(attempt_prefix, prefer_ext=prefer_ext)
+
+            if not file_path or not os.path.exists(file_path):
+                last_error = RuntimeError("Downloaded file not found")
+                _cleanup_tmp_files(attempt_prefix)
+                if not is_youtube:
+                    raise last_error
+                continue
+
+            final_size = os.path.getsize(file_path)
+            if final_size == 0:
+                last_error = RuntimeError("Downloaded file is empty")
+                _cleanup_tmp_files(attempt_prefix)
+                file_path = None
+                if not is_youtube:
+                    raise last_error
+                continue
+
+            if final_size > MAX_SEND_BYTES and mode != "audio":
+                last_error = RuntimeError(
+                    f"This file is {_fmt_bytes(final_size)}, which exceeds the limit {_fmt_bytes(MAX_SEND_BYTES)}."
+                )
+                _cleanup_tmp_files(attempt_prefix)
+                file_path = None
+                if not is_youtube:
+                    raise last_error
+                continue
+
+            break
+
         if not file_path:
-            file_path = _find_file_by_prefix(tmp_id, prefer_ext=prefer_ext)
-
-        if not file_path or not os.path.exists(file_path):
+            if is_youtube:
+                raise RuntimeError("YouTube download failed after multiple safe format retries. Try again later.")
+            if last_error:
+                raise last_error
             raise RuntimeError("Downloaded file not found")
-
-        # Final hard check before upload
-        final_size = os.path.getsize(file_path)
-        if final_size > MAX_SEND_BYTES:
-            raise RuntimeError(
-                f"This file is {_fmt_bytes(final_size)}, which exceeds the limit {_fmt_bytes(MAX_SEND_BYTES)}."
-            )
 
         base = _sanitize_filename_base(title)
 
@@ -910,14 +1009,7 @@ def _download_and_send(job: Dict[str, Any]) -> None:
         except Exception:
             pass
 
-        try:
-            for fn in os.listdir(config.output_folder):
-                if fn.startswith(tmp_id):
-                    fp = os.path.join(config.output_folder, fn)
-                    if os.path.exists(fp):
-                        os.remove(fp)
-        except Exception:
-            pass
+        _cleanup_tmp_files(base_prefix)
 
         cancel_events.pop(job_id, None)
         active_jobs.pop(job_id, None)
@@ -1155,7 +1247,7 @@ def handle_private_messages(message):
         bot.reply_to(message, "Invalid URL", disable_web_page_preview=True)
         return
 
-    if url_info.netloc in ["www.youtube.com", "youtu.be", "youtube.com", "youtu.be"]:
+    if _is_youtube_url(url):
         if not youtube_url_validation(url):
             bot.reply_to(message, "Invalid URL", disable_web_page_preview=True)
             return
@@ -1307,8 +1399,7 @@ def custom(message):
     msg = bot.reply_to(message, "Getting formats...", disable_web_page_preview=True)
 
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
-            info = ydl.extract_info(text, download=False)
+        info = _get_video_meta(text)
 
         data = {
             f"{x.get('resolution')}.{x.get('ext')}": {"callback_data": f"{x.get('format_id')}"}
