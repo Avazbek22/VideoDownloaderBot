@@ -21,11 +21,13 @@ from app.download_utils import (
     render_status as _render_status,
 )
 from app.planner import (
+    apply_instagram_stability_opts as _apply_instagram_stability_opts,
     apply_youtube_runtime_opts as _apply_youtube_runtime_opts,
     apply_probe_if_needed as _apply_probe_if_needed,
     build_audio_plan_mp3 as _build_audio_plan_mp3,
     build_video_plan_no_squeeze as _build_video_plan_no_squeeze,
     get_video_meta as _get_video_meta,
+    is_instagram_url as _is_instagram_url,
     is_youtube_url as _is_youtube_url,
 )
 from app.text_utils import (
@@ -59,6 +61,11 @@ YTDLP_CONCURRENT_FRAGMENTS = 4
 # YouTube JS challenge runtime settings (stable defaults, no account/cookies required)
 YTDLP_JS_RUNTIMES = (os.getenv("YTDLP_JS_RUNTIMES") or "node").strip() or "node"
 YTDLP_REMOTE_COMPONENTS = (os.getenv("YTDLP_REMOTE_COMPONENTS") or "ejs:github").strip() or "ejs:github"
+# Instagram stability profile (no account/cookies required)
+YTDLP_INSTAGRAM_IMPERSONATE = (os.getenv("YTDLP_INSTAGRAM_IMPERSONATE") or "chrome").strip() or "chrome"
+YTDLP_INSTAGRAM_RETRIES = int(os.getenv("YTDLP_INSTAGRAM_RETRIES") or "8")
+YTDLP_INSTAGRAM_FRAGMENT_RETRIES = int(os.getenv("YTDLP_INSTAGRAM_FRAGMENT_RETRIES") or "8")
+YTDLP_INSTAGRAM_SOCKET_TIMEOUT = int(os.getenv("YTDLP_INSTAGRAM_SOCKET_TIMEOUT") or "30")
 
 
 # =========================
@@ -244,6 +251,32 @@ def _find_downloaded_file(info: Dict[str, Any], fallback_prefix: str, prefer_ext
     return _find_downloaded_file_impl(info, config.output_folder, fallback_prefix, prefer_ext=prefer_ext)
 
 
+def _get_video_meta_with_hidden_retries(url: str) -> Dict[str, Any]:
+    try:
+        return _get_video_meta(
+            url,
+            js_runtimes=YTDLP_JS_RUNTIMES,
+            remote_components=YTDLP_REMOTE_COMPONENTS,
+            instagram_impersonate=YTDLP_INSTAGRAM_IMPERSONATE,
+            instagram_retries=YTDLP_INSTAGRAM_RETRIES,
+            instagram_fragment_retries=YTDLP_INSTAGRAM_FRAGMENT_RETRIES,
+            instagram_socket_timeout=YTDLP_INSTAGRAM_SOCKET_TIMEOUT,
+        )
+    except Exception:
+        if not _is_instagram_url(url):
+            raise
+        # Fallback: retry without forced impersonation.
+        return _get_video_meta(
+            url,
+            js_runtimes=YTDLP_JS_RUNTIMES,
+            remote_components=YTDLP_REMOTE_COMPONENTS,
+            instagram_impersonate=None,
+            instagram_retries=5,
+            instagram_fragment_retries=5,
+            instagram_socket_timeout=20,
+        )
+
+
 # =========================
 # Worker: download + send
 # =========================
@@ -314,6 +347,14 @@ def _download_and_send(job: Dict[str, Any]) -> None:
         "socket_timeout": 20,
     }
     ydl_opts = _apply_youtube_runtime_opts(ydl_opts, url, YTDLP_JS_RUNTIMES, YTDLP_REMOTE_COMPONENTS)
+    ydl_opts = _apply_instagram_stability_opts(
+        ydl_opts,
+        url,
+        impersonate=YTDLP_INSTAGRAM_IMPERSONATE,
+        retries=YTDLP_INSTAGRAM_RETRIES,
+        fragment_retries=YTDLP_INSTAGRAM_FRAGMENT_RETRIES,
+        socket_timeout=YTDLP_INSTAGRAM_SOCKET_TIMEOUT,
+    )
 
     if plan.get("merge_output_format"):
         ydl_opts["merge_output_format"] = str(plan["merge_output_format"])
@@ -347,14 +388,22 @@ def _download_and_send(job: Dict[str, Any]) -> None:
                 info = ydl.extract_info(url, download=True)
         except Exception:
             # Conservative one-shot fallback for YouTube extractor churn.
-            if not _is_youtube_url(url) or mode == "audio":
+            if _is_youtube_url(url) and mode != "audio":
+                fallback_opts = dict(ydl_opts)
+                fallback_opts["format"] = "18/best[ext=mp4]/best"
+                fallback_opts["concurrent_fragment_downloads"] = 1
+                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+            elif _is_instagram_url(url):
+                fallback_opts = dict(ydl_opts)
+                fallback_opts.pop("impersonate", None)
+                fallback_opts["retries"] = 5
+                fallback_opts["fragment_retries"] = 5
+                fallback_opts["socket_timeout"] = 20
+                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+            else:
                 raise
-
-            fallback_opts = dict(ydl_opts)
-            fallback_opts["format"] = "18/best[ext=mp4]/best"
-            fallback_opts["concurrent_fragment_downloads"] = 1
-            with yt_dlp.YoutubeDL(fallback_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
 
         if _is_cancelled(job_id):
             _safe_delete(chat_id, status_message_id)
@@ -528,7 +577,7 @@ def _send_choice_ui(message, url: str) -> None:
     processing_msg = bot.reply_to(message, "Getting info...", disable_web_page_preview=True)
 
     try:
-        meta = _get_video_meta(url, js_runtimes=YTDLP_JS_RUNTIMES, remote_components=YTDLP_REMOTE_COMPONENTS)
+        meta = _get_video_meta_with_hidden_retries(url)
     except Exception:
         _safe_delete(message.chat.id, processing_msg.message_id)
         bot.reply_to(message, "Invalid URL or unsupported website.", disable_web_page_preview=True)
@@ -839,7 +888,7 @@ def custom(message):
     msg = bot.reply_to(message, "Getting formats...", disable_web_page_preview=True)
 
     try:
-        info = _get_video_meta(text, js_runtimes=YTDLP_JS_RUNTIMES, remote_components=YTDLP_REMOTE_COMPONENTS)
+        info = _get_video_meta_with_hidden_retries(text)
 
         data = {
             f"{x.get('resolution')}.{x.get('ext')}": {"callback_data": f"{x.get('format_id')}"}

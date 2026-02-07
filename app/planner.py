@@ -3,6 +3,7 @@ from urllib.parse import urlparse
 from typing import Any, Dict, Optional, Tuple
 
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
 from app.http_utils import requests_session_with_retries
 from app.text_utils import fmt_bytes
@@ -21,6 +22,20 @@ def is_youtube_url(url: str) -> bool:
             "youtube.com",
             "youtu.be",
             "youtube-nocookie.com",
+        )
+    )
+
+
+def is_instagram_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        return False
+    return any(
+        x in host
+        for x in (
+            "instagram.com",
+            "instagr.am",
         )
     )
 
@@ -53,6 +68,33 @@ def apply_youtube_runtime_opts(
         comps = [x.strip() for x in str(remote_components).split(",") if x.strip()]
         if comps:
             opts["remote_components"] = comps
+    return opts
+
+
+def apply_instagram_stability_opts(
+    opts: Dict[str, Any],
+    url: str,
+    impersonate: Optional[str],
+    retries: Optional[int],
+    fragment_retries: Optional[int],
+    socket_timeout: Optional[int],
+) -> Dict[str, Any]:
+    if not is_instagram_url(url):
+        return opts
+    if impersonate:
+        imp = str(impersonate).strip()
+        if imp:
+            try:
+                opts["impersonate"] = ImpersonateTarget.from_str(imp)
+            except Exception:
+                # If parsing fails, keep working without forced impersonation.
+                pass
+    if isinstance(retries, int) and retries > 0:
+        opts["retries"] = retries
+    if isinstance(fragment_retries, int) and fragment_retries > 0:
+        opts["fragment_retries"] = fragment_retries
+    if isinstance(socket_timeout, int) and socket_timeout > 0:
+        opts["socket_timeout"] = socket_timeout
     return opts
 
 
@@ -104,9 +146,21 @@ def get_video_meta(
     url: str,
     js_runtimes: Optional[str] = None,
     remote_components: Optional[str] = None,
+    instagram_impersonate: Optional[str] = None,
+    instagram_retries: Optional[int] = None,
+    instagram_fragment_retries: Optional[int] = None,
+    instagram_socket_timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
     ydl_opts: Dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
     ydl_opts = apply_youtube_runtime_opts(ydl_opts, url, js_runtimes, remote_components)
+    ydl_opts = apply_instagram_stability_opts(
+        ydl_opts,
+        url,
+        impersonate=instagram_impersonate,
+        retries=instagram_retries,
+        fragment_retries=instagram_fragment_retries,
+        socket_timeout=instagram_socket_timeout,
+    )
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 

@@ -130,6 +130,10 @@ OUTPUT_FOLDER=/tmp/yt-dlp-telegram
 YTDLP_AUTO_UPDATE=1
 YTDLP_JS_RUNTIMES=node
 YTDLP_REMOTE_COMPONENTS=ejs:github
+YTDLP_INSTAGRAM_IMPERSONATE=chrome
+YTDLP_INSTAGRAM_RETRIES=8
+YTDLP_INSTAGRAM_FRAGMENT_RETRIES=8
+YTDLP_INSTAGRAM_SOCKET_TIMEOUT=30
 EOF
 
   # Keep config.py minimal: only reads env; logs=None; max_filesize fixed to 50MB
@@ -252,7 +256,7 @@ update_system_mode() {
   before="$("$py" -c "$yt_dlp_version_py" 2>/dev/null || echo "unknown")"
   log "System mode: current yt-dlp version: $before"
 
-  if ! "$py" -m pip install --upgrade --disable-pip-version-check "yt-dlp[default]" >>"$LOG_FILE" 2>&1; then
+  if ! "$py" -m pip install --upgrade --disable-pip-version-check "yt-dlp[default,curl-cffi]" >>"$LOG_FILE" 2>&1; then
     log "System mode: pip update failed"
     return 1
   fi
@@ -287,7 +291,7 @@ update_docker_mode() {
   before="$(docker exec videodownloaderbot python -c "$yt_dlp_version_py" 2>/dev/null || echo "unknown")"
   log "Docker mode: current yt-dlp version: $before"
 
-  if ! docker exec videodownloaderbot python -m pip install --upgrade --disable-pip-version-check "yt-dlp[default]" >>"$LOG_FILE" 2>&1; then
+  if ! docker exec videodownloaderbot python -m pip install --upgrade --disable-pip-version-check "yt-dlp[default,curl-cffi]" >>"$LOG_FILE" 2>&1; then
     log "Docker mode: pip update failed"
     return 1
   fi
