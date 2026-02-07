@@ -3,9 +3,7 @@ import datetime
 import telebot
 import config
 import yt_dlp
-import re
 import os
-import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 from telebot import types
 from telebot.util import quick_markup
@@ -15,8 +13,28 @@ import queue
 import uuid
 from typing import Optional, Dict, Any, Tuple, List
 
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from app.http_utils import requests_session_with_retries as _requests_session_with_retries
+from app.download_utils import (
+    calc_download_progress as _calc_download_progress,
+    find_downloaded_file as _find_downloaded_file_impl,
+    find_file_by_prefix as _find_file_by_prefix_impl,
+    render_status as _render_status,
+)
+from app.planner import (
+    apply_youtube_runtime_opts as _apply_youtube_runtime_opts,
+    apply_probe_if_needed as _apply_probe_if_needed,
+    build_audio_plan_mp3 as _build_audio_plan_mp3,
+    build_video_plan_no_squeeze as _build_video_plan_no_squeeze,
+    get_video_meta as _get_video_meta,
+    is_youtube_url as _is_youtube_url,
+)
+from app.text_utils import (
+    extract_first_url as _extract_first_url,
+    fmt_bytes as _fmt_bytes,
+    sanitize_filename_base as _sanitize_filename_base,
+    strip_hashtags as _strip_hashtags,
+    youtube_url_validation,
+)
 
 
 # =========================
@@ -38,9 +56,9 @@ MAX_SEND_BYTES = int(getattr(config, "max_filesize", 50_000_000))
 
 # yt-dlp optimization for segmented streams (HLS/DASH)
 YTDLP_CONCURRENT_FRAGMENTS = 4
-
-# Audio planning headroom (bytes). Keeps us safe vs metadata inaccuracies/overhead.
-AUDIO_HEADROOM_BYTES = 1_500_000
+# YouTube JS challenge runtime settings (stable defaults, no account/cookies required)
+YTDLP_JS_RUNTIMES = (os.getenv("YTDLP_JS_RUNTIMES") or "node").strip() or "node"
+YTDLP_REMOTE_COMPONENTS = (os.getenv("YTDLP_REMOTE_COMPONENTS") or "ejs:github").strip() or "ejs:github"
 
 
 # =========================
@@ -122,69 +140,6 @@ def _safe_answer_callback(call_id: str, text: str = "") -> None:
 
 
 # =========================
-# URL / title helpers
-# =========================
-def youtube_url_validation(url: str):
-    youtube_regex = (
-        r'(https?://)?(www\.)?'
-        r'(youtube|youtu|youtube-nocookie)\.(com|be)/'
-        r'(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
-    )
-    return re.match(youtube_regex, url)
-
-
-def _extract_first_url(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = re.search(r"(https?://\S+)", text.strip())
-    if not m:
-        return None
-    url = m.group(1).strip()
-    url = url.rstrip(").,]}>\"'")
-    return url
-
-
-def _strip_hashtags(s: str) -> str:
-    # Remove hashtag tokens like #tag, #слово
-    s = re.sub(r"(?<!\w)#[\w\-\_]+", "", s, flags=re.UNICODE)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
-
-
-def _sanitize_filename_base(title: str, max_len: int = 120) -> str:
-    title = _strip_hashtags(title)
-
-    # Windows forbidden chars + control chars
-    title = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", title)
-    title = title.replace("\n", " ").replace("\r", " ").strip()
-
-    # Windows hates trailing dots/spaces
-    title = title.rstrip(". ").strip()
-
-    if not title:
-        title = "video"
-
-    if len(title) > max_len:
-        title = title[:max_len].rstrip()
-
-    return title
-
-
-def _fmt_bytes(n: Optional[int]) -> str:
-    if not isinstance(n, int) or n < 0:
-        return "unknown"
-    units = ["B", "KB", "MB", "GB"]
-    v = float(n)
-    i = 0
-    while v >= 1024 and i < len(units) - 1:
-        v /= 1024
-        i += 1
-    if i == 0:
-        return f"{int(v)} {units[i]}"
-    return f"{v:.1f} {units[i]}"
-
-
-# =========================
 # Cancel UI
 # =========================
 def _cancel_markup(job_id: str) -> types.InlineKeyboardMarkup:
@@ -196,352 +151,6 @@ def _cancel_markup(job_id: str) -> types.InlineKeyboardMarkup:
 def _is_cancelled(job_id: str) -> bool:
     ev = cancel_events.get(job_id)
     return bool(ev and ev.is_set())
-
-
-# =========================
-# Progress calc (no fake 100% flash)
-# =========================
-def _calc_download_progress(d: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """
-    Returns (percent, downloaded_bytes, total_bytes).
-    - Prefer fragment-based progress for HLS/DASH.
-    - Never show 100% until status == "finished".
-    """
-    downloaded = d.get("downloaded_bytes")
-    total = d.get("total_bytes")
-
-    frag_count = d.get("fragment_count")
-    frag_index = d.get("fragment_index")
-
-    if isinstance(frag_count, int) and frag_count > 0 and isinstance(frag_index, int):
-        idx = frag_index
-        if idx < 0:
-            idx = 0
-        if idx > frag_count:
-            idx = frag_count
-
-        pct = int((idx * 100) / frag_count)
-        if pct >= 100:
-            pct = 99
-
-        prev = state.get("pct", 0)
-        if pct < prev:
-            pct = prev
-        state["pct"] = pct
-        return pct, None, None
-
-    if isinstance(total, int) and total > 0 and isinstance(downloaded, int) and downloaded >= 0:
-        pct = int((downloaded * 100) / total)
-        if pct >= 100:
-            pct = 99
-
-        prev = state.get("pct", 0)
-        if pct < prev:
-            pct = prev
-        state["pct"] = pct
-        return pct, downloaded, total
-
-    # Estimate as last resort (not used for pre-check decisions)
-    total_est = d.get("total_bytes_estimate")
-    if isinstance(total_est, int) and total_est > 0 and isinstance(downloaded, int) and downloaded >= 0:
-        pct = int((downloaded * 100) / total_est)
-        if pct >= 100:
-            pct = 99
-
-        prev = state.get("pct", 0)
-        if pct < prev:
-            pct = prev
-        state["pct"] = pct
-        return pct, downloaded, total_est
-
-    return None, downloaded if isinstance(downloaded, int) else None, None
-
-
-# =========================
-# Requests session (retries)
-# =========================
-def _requests_session_with_retries() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=4,
-        connect=4,
-        read=4,
-        backoff_factor=0.6,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["POST", "GET", "HEAD"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
-
-
-# =========================
-# Pre-check: probe URL size via Range request
-# =========================
-def _probe_url_size_bytes(url: str, timeout_sec: int = 10) -> Optional[int]:
-    """
-    Try to get real content size without downloading the file:
-    - Send GET with Range: bytes=0-0
-    - Parse Content-Range: bytes 0-0/123456
-    """
-    if not url or not isinstance(url, str):
-        return None
-
-    s = _requests_session_with_retries()
-    try:
-        resp = s.get(
-            url,
-            headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"},
-            stream=True,
-            timeout=(timeout_sec, timeout_sec),
-            allow_redirects=True,
-        )
-        cr = resp.headers.get("Content-Range") or resp.headers.get("content-range")
-        if cr:
-            m = re.search(r"/(\d+)\s*$", cr.strip())
-            if m:
-                total = int(m.group(1))
-                if total > 0:
-                    return total
-
-        # Some servers may return Content-Length for full response (rare with range).
-        cl = resp.headers.get("Content-Length") or resp.headers.get("content-length")
-        if cl and cl.isdigit():
-            # With range it can be 1 byte; ignore tiny values.
-            val = int(cl)
-            if val > 1024 * 1024:
-                return val
-
-        return None
-    except Exception:
-        return None
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
-
-
-# =========================
-# yt-dlp meta fetch
-# =========================
-def _get_video_meta(url: str) -> Dict[str, Any]:
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-# =========================
-# Plans (NO quality squeezing)
-# =========================
-def _duration_sec(meta: Dict[str, Any]) -> Optional[int]:
-    dur = meta.get("duration")
-    if isinstance(dur, (int, float)) and dur > 0:
-        return int(dur)
-    return None
-
-
-def _format_size_bytes(fmt: Dict[str, Any], dur: Optional[int]) -> Tuple[Optional[int], bool]:
-    """
-    Returns (size_bytes, confident).
-    confident=True when size comes from 'filesize' or 'filesize_approx' or URL probe.
-    """
-    fs = fmt.get("filesize")
-    if isinstance(fs, int) and fs > 0:
-        return fs, True
-
-    fsa = fmt.get("filesize_approx")
-    if isinstance(fsa, int) and fsa > 0:
-        return fsa, True
-
-    # Bitrate estimation is NOT confident (we don't use it to block/allow).
-    tbr = fmt.get("tbr")  # usually Kbps
-    if dur and isinstance(tbr, (int, float)) and tbr > 0:
-        est = int(dur * (float(tbr) * 1000.0 / 8.0))
-        if est > 0:
-            return est, False
-
-    return None, False
-
-
-def _best_progressive_mp4(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Pick the best progressive MP4 (video+audio in one file), no limit filtering.
-    """
-    dur = _duration_sec(meta)
-    best = None
-    best_key = None
-
-    for f in meta.get("formats", []) or []:
-        if f.get("ext") != "mp4":
-            continue
-        if f.get("vcodec") == "none" or f.get("acodec") == "none":
-            continue
-
-        height = f.get("height") or 0
-        fps = f.get("fps") or 0
-        tbr = f.get("tbr") or 0
-
-        key = (int(height), int(fps), float(tbr))
-        if best is None or key > best_key:
-            size, conf = _format_size_bytes(f, dur)
-            best = {
-                "kind": "progressive",
-                "format_spec": str(f.get("format_id")),
-                "merge_output_format": None,
-                "estimated_size": size,
-                "estimated_confident": bool(conf),
-                "probe_urls": [f.get("url")] if f.get("url") else [],
-                "quality_label": f"{height}p" if height else "mp4",
-            }
-            best_key = key
-
-    return best
-
-
-def _best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Pick best mp4 video-only + best m4a audio-only, no limit filtering.
-    """
-    dur = _duration_sec(meta)
-
-    best_v = None
-    best_v_key = None
-    best_a = None
-    best_a_key = None
-
-    for f in meta.get("formats", []) or []:
-        vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        ext = f.get("ext")
-
-        # video-only mp4
-        if ext == "mp4" and vcodec != "none" and acodec == "none":
-            height = f.get("height") or 0
-            fps = f.get("fps") or 0
-            tbr = f.get("tbr") or 0
-            key = (int(height), int(fps), float(tbr))
-            if best_v is None or key > best_v_key:
-                size, conf = _format_size_bytes(f, dur)
-                best_v = {"f": f, "size": size, "conf": conf}
-                best_v_key = key
-
-        # audio-only m4a (or mp4 audio-only)
-        if vcodec == "none" and acodec != "none" and ext in ("m4a", "mp4"):
-            abr = f.get("abr") or f.get("tbr") or 0
-            key = float(abr)
-            if best_a is None or key > best_a_key:
-                size, conf = _format_size_bytes(f, dur)
-                best_a = {"f": f, "size": size, "conf": conf}
-                best_a_key = key
-
-    if not best_v or not best_a:
-        return None
-
-    total_size = None
-    confident = False
-    if isinstance(best_v["size"], int) and isinstance(best_a["size"], int):
-        total_size = int(best_v["size"]) + int(best_a["size"])
-        confident = bool(best_v["conf"] and best_a["conf"])
-
-    vf = best_v["f"]
-    af = best_a["f"]
-    height = vf.get("height") or 0
-
-    urls = []
-    if vf.get("url"):
-        urls.append(vf.get("url"))
-    if af.get("url"):
-        urls.append(af.get("url"))
-
-    return {
-        "kind": "separate",
-        "format_spec": f"{vf.get('format_id')}+{af.get('format_id')}",
-        "merge_output_format": "mp4",
-        "estimated_size": total_size,
-        "estimated_confident": confident,
-        "probe_urls": urls,
-        "quality_label": f"{height}p" if height else "mp4",
-    }
-
-
-def _build_video_plan_no_squeeze(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Build a video plan without reducing quality.
-    We will NOT download unless we can confidently prove size <= limit.
-    """
-    p = _best_progressive_mp4(meta)
-    if p:
-        return p
-
-    p = _best_separate_mp4_m4a(meta)
-    if p:
-        return p
-
-    # Fallback: let yt-dlp pick "best"; size will likely be unknown -> we will refuse by policy.
-    return {
-        "kind": "unknown",
-        "format_spec": "best",
-        "merge_output_format": None,
-        "estimated_size": None,
-        "estimated_confident": False,
-        "probe_urls": [],
-        "quality_label": "best",
-    }
-
-
-def _apply_probe_if_needed(plan: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    If plan does not have confident size, try probing direct URLs (Range request).
-    If we can probe all URLs -> confident total.
-    """
-    if plan.get("estimated_confident") and isinstance(plan.get("estimated_size"), int):
-        return plan
-
-    urls = plan.get("probe_urls") or []
-    urls = [u for u in urls if isinstance(u, str) and u.startswith("http")]
-
-    if not urls:
-        return plan
-
-    sizes = []
-    for u in urls:
-        sz = _probe_url_size_bytes(u)
-        if not isinstance(sz, int) or sz <= 0:
-            return plan
-        sizes.append(sz)
-
-    total = int(sum(sizes))
-    plan["estimated_size"] = total
-    plan["estimated_confident"] = True
-    return plan
-
-
-def _build_audio_plan_mp3(meta: Dict[str, Any], limit_bytes: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Audio is allowed only if we can confidently keep MP3 under the limit.
-    We compute it from duration and pick a bitrate that fits with headroom.
-    """
-    dur = _duration_sec(meta)
-    if not dur:
-        return None, "Cannot determine duration, so I can't reliably estimate MP3 size."
-
-    # Choose the highest standard bitrate that fits (with headroom)
-    candidates = [192, 160, 128, 112, 96, 80, 64, 48, 32]
-    for br in candidates:
-        est = int(dur * (br * 1000 / 8))
-        if est + AUDIO_HEADROOM_BYTES <= limit_bytes:
-            return {
-                "format_spec": "bestaudio/best",
-                "merge_output_format": None,
-                "mp3_kbps": br,
-                "estimated_size": est,
-                "estimated_confident": True,
-                "quality_label": f"mp3 {br}kbps",
-            }, None
-
-    return None, f"Audio is too long to fit into {_fmt_bytes(limit_bytes)} even at low bitrate."
 
 
 # =========================
@@ -625,103 +234,14 @@ def _send_via_bot_api_with_progress(
 
 
 # =========================
-# Status rendering
-# =========================
-def _render_status(
-    title: str,
-    stage: str,
-    pct: Optional[int],
-    downloaded: Optional[int],
-    total: Optional[int],
-    queued_pos: Optional[int] = None
-) -> str:
-    if stage == "queued":
-        line = "Status: ⏳ Queued"
-        if queued_pos is not None:
-            line += f" (#{queued_pos})"
-        return f"{title}\n\n{line}"
-
-    if stage == "downloading":
-        line = "Status: ⬇️ Downloading..."
-        if pct is not None:
-            line += f" {pct}%"
-        if isinstance(downloaded, int) and isinstance(total, int) and total > 0:
-            line += f"\n{_fmt_bytes(downloaded)} / {_fmt_bytes(total)}"
-        return f"{title}\n\n{line}"
-
-    if stage == "sending_video":
-        line = "Status: ⬆️ Sending video..."
-        if pct is not None:
-            line += f" {pct}%"
-        return f"{title}\n\n{line}"
-
-    if stage == "sending_document":
-        line = "Status: ⬆️ Sending document..."
-        if pct is not None:
-            line += f" {pct}%"
-        return f"{title}\n\n{line}"
-
-    if stage == "sending_audio":
-        line = "Status: ⬆️ Sending audio..."
-        if pct is not None:
-            line += f" {pct}%"
-        return f"{title}\n\n{line}"
-
-    if stage == "cancelled":
-        return f"{title}\n\nStatus: ⛔ Cancelled"
-
-    if stage == "error":
-        return f"{title}\n\nStatus: ❌ Error"
-
-    return f"{title}\n\nStatus: ✅ Done!"
-
-
-# =========================
 # Downloaded file discovery
 # =========================
 def _find_file_by_prefix(prefix: str, prefer_ext: Optional[str] = None) -> Optional[str]:
-    try:
-        files = [fn for fn in os.listdir(config.output_folder) if fn.startswith(prefix)]
-        if not files:
-            return None
-
-        if prefer_ext:
-            for fn in files:
-                if fn.lower().endswith(prefer_ext.lower()):
-                    fp = os.path.join(config.output_folder, fn)
-                    if os.path.exists(fp):
-                        return fp
-
-        best = None
-        best_mtime = -1
-        for fn in files:
-            fp = os.path.join(config.output_folder, fn)
-            try:
-                mtime = os.path.getmtime(fp)
-                if mtime > best_mtime:
-                    best_mtime = mtime
-                    best = fp
-            except Exception:
-                pass
-
-        if best and os.path.exists(best):
-            return best
-
-    except Exception:
-        pass
-    return None
+    return _find_file_by_prefix_impl(config.output_folder, prefix, prefer_ext=prefer_ext)
 
 
 def _find_downloaded_file(info: Dict[str, Any], fallback_prefix: str, prefer_ext: Optional[str] = None) -> Optional[str]:
-    try:
-        req = (info.get("requested_downloads") or [])[0]
-        fp = req.get("filepath")
-        if fp and os.path.exists(fp):
-            return fp
-    except Exception:
-        pass
-
-    return _find_file_by_prefix(fallback_prefix, prefer_ext=prefer_ext)
+    return _find_downloaded_file_impl(info, config.output_folder, fallback_prefix, prefer_ext=prefer_ext)
 
 
 # =========================
@@ -793,6 +313,7 @@ def _download_and_send(job: Dict[str, Any]) -> None:
         "fragment_retries": 5,
         "socket_timeout": 20,
     }
+    ydl_opts = _apply_youtube_runtime_opts(ydl_opts, url, YTDLP_JS_RUNTIMES, YTDLP_REMOTE_COMPONENTS)
 
     if plan.get("merge_output_format"):
         ydl_opts["merge_output_format"] = str(plan["merge_output_format"])
@@ -821,8 +342,19 @@ def _download_and_send(job: Dict[str, Any]) -> None:
             force=True
         )
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception:
+            # Conservative one-shot fallback for YouTube extractor churn.
+            if not _is_youtube_url(url) or mode == "audio":
+                raise
+
+            fallback_opts = dict(ydl_opts)
+            fallback_opts["format"] = "18/best[ext=mp4]/best"
+            fallback_opts["concurrent_fragment_downloads"] = 1
+            with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
         if _is_cancelled(job_id):
             _safe_delete(chat_id, status_message_id)
@@ -996,7 +528,7 @@ def _send_choice_ui(message, url: str) -> None:
     processing_msg = bot.reply_to(message, "Getting info...", disable_web_page_preview=True)
 
     try:
-        meta = _get_video_meta(url)
+        meta = _get_video_meta(url, js_runtimes=YTDLP_JS_RUNTIMES, remote_components=YTDLP_REMOTE_COMPONENTS)
     except Exception:
         _safe_delete(message.chat.id, processing_msg.message_id)
         bot.reply_to(message, "Invalid URL or unsupported website.", disable_web_page_preview=True)
@@ -1307,8 +839,7 @@ def custom(message):
     msg = bot.reply_to(message, "Getting formats...", disable_web_page_preview=True)
 
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
-            info = ydl.extract_info(text, download=False)
+        info = _get_video_meta(text, js_runtimes=YTDLP_JS_RUNTIMES, remote_components=YTDLP_REMOTE_COMPONENTS)
 
         data = {
             f"{x.get('resolution')}.{x.get('ext')}": {"callback_data": f"{x.get('format_id')}"}

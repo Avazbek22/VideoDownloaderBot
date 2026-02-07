@@ -9,6 +9,7 @@ set -euo pipefail
 # - Installs ffmpeg (codecs) + required deps
 # - Supports Docker (recommended) or systemd service install
 # - Works with docker compose v2 OR docker-compose v1
+# - Sets up nightly yt-dlp auto-update timer (server-side)
 # =========================
 
 REPO_URL_DEFAULT="https://github.com/Avazbek22/VideoDownloaderBot.git"
@@ -92,10 +93,10 @@ ensure_universe_enabled() {
 }
 
 install_base_deps() {
-  say "Installing system dependencies (python3, venv, pip, git, ffmpeg)..."
+  say "Installing system dependencies (python3, venv, pip, git, ffmpeg, nodejs)..."
   as_root apt-get update -y
   as_root apt-get install -y --no-install-recommends \
-    ca-certificates curl git python3 python3-venv python3-pip ffmpeg
+    ca-certificates curl git python3 python3-venv python3-pip ffmpeg nodejs
   ok "FFmpeg installed. Codecs are included in Ubuntu's ffmpeg build."
 }
 
@@ -126,6 +127,9 @@ write_env_and_config() {
   cat > "$install_dir/.env" <<EOF
 BOT_TOKEN=$token
 OUTPUT_FOLDER=/tmp/yt-dlp-telegram
+YTDLP_AUTO_UPDATE=1
+YTDLP_JS_RUNTIMES=node
+YTDLP_REMOTE_COMPONENTS=ejs:github
 EOF
 
   # Keep config.py minimal: only reads env; logs=None; max_filesize fixed to 50MB
@@ -155,6 +159,226 @@ PY
   fi
 
   ok "Created config.py (env-based) + .env"
+}
+
+write_ytdlp_updater_script() {
+  local install_dir="$1"
+  mkdir -p "$install_dir/scripts"
+
+  cat > "$install_dir/scripts/ytdlp-nightly-update.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$INSTALL_DIR/.env"
+LOG_DIR="$INSTALL_DIR/logs"
+LOG_FILE="$LOG_DIR/ytdlp-auto-update.log"
+
+mkdir -p "$LOG_DIR"
+
+log() {
+  printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
+}
+
+load_env() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  while IFS= read -r raw; do
+    line="${raw#"${raw%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" != *=* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    value="${value%\"}"
+    value="${value#\"}"
+    value="${value%\'}"
+    value="${value#\'}"
+    export "$key=$value"
+  done < "$ENV_FILE"
+}
+
+yt_dlp_version_py='import yt_dlp
+v = getattr(yt_dlp, "__version__", None)
+if not v:
+    v = getattr(getattr(yt_dlp, "version", None), "__version__", None)
+print(v or "unknown")'
+
+check_runtime_py='import os, shutil
+raw = (os.getenv("YTDLP_JS_RUNTIMES") or "node").split(",")[0].strip()
+runtime, _, path = raw.partition(":")
+runtime = runtime.strip() or "node"
+target = (path.strip() if path.strip() else runtime)
+print(f"runtime={runtime} target={target} found={bool(shutil.which(target) if target == runtime else os.path.exists(target))}")'
+
+detect_compose() {
+  if command -v docker >/dev/null 2>&1; then
+    if docker compose version >/dev/null 2>&1; then
+      echo "docker compose"
+      return 0
+    fi
+    if command -v docker-compose >/dev/null 2>&1; then
+      echo "docker-compose"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+restart_system_service_if_exists() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files --type=service | grep -q '^videodownloaderbot\.service'; then
+    systemctl restart videodownloaderbot.service
+    log "Restarted videodownloaderbot.service"
+  else
+    log "videodownloaderbot.service not found; skip restart"
+  fi
+}
+
+log_runtime_status_system() {
+  local py="$INSTALL_DIR/.venv/bin/python"
+  [[ -x "$py" ]] || return 0
+  "$py" -c "$check_runtime_py" >>"$LOG_FILE" 2>&1 || true
+}
+
+log_runtime_status_docker() {
+  docker exec videodownloaderbot python -c "$check_runtime_py" >>"$LOG_FILE" 2>&1 || true
+}
+
+update_system_mode() {
+  local py="$INSTALL_DIR/.venv/bin/python"
+  if [[ ! -x "$py" ]]; then
+    return 1
+  fi
+
+  local before after
+  before="$("$py" -c "$yt_dlp_version_py" 2>/dev/null || echo "unknown")"
+  log "System mode: current yt-dlp version: $before"
+
+  if ! "$py" -m pip install --upgrade --disable-pip-version-check "yt-dlp[default]" >>"$LOG_FILE" 2>&1; then
+    log "System mode: pip update failed"
+    return 1
+  fi
+
+  after="$("$py" -c "$yt_dlp_version_py" 2>/dev/null || echo "unknown")"
+  if [[ "$before" != "$after" ]]; then
+    log "System mode: yt-dlp updated: $before -> $after"
+    restart_system_service_if_exists
+  else
+    log "System mode: yt-dlp already up to date: $after"
+  fi
+  log_runtime_status_system
+  return 0
+}
+
+update_docker_mode() {
+  [[ -f "$INSTALL_DIR/docker-compose.yml" ]] || return 1
+  command -v docker >/dev/null 2>&1 || return 1
+
+  local compose_cmd=""
+  compose_cmd="$(detect_compose || true)"
+  if [[ -n "$compose_cmd" ]]; then
+    (cd "$INSTALL_DIR" && $compose_cmd up -d >/dev/null 2>&1) || true
+  fi
+
+  if ! docker ps --format '{{.Names}}' | grep -qx "videodownloaderbot"; then
+    log "Docker mode: container 'videodownloaderbot' is not running; skip"
+    return 1
+  fi
+
+  local before after
+  before="$(docker exec videodownloaderbot python -c "$yt_dlp_version_py" 2>/dev/null || echo "unknown")"
+  log "Docker mode: current yt-dlp version: $before"
+
+  if ! docker exec videodownloaderbot python -m pip install --upgrade --disable-pip-version-check "yt-dlp[default]" >>"$LOG_FILE" 2>&1; then
+    log "Docker mode: pip update failed"
+    return 1
+  fi
+
+  after="$(docker exec videodownloaderbot python -c "$yt_dlp_version_py" 2>/dev/null || echo "unknown")"
+  if [[ "$before" != "$after" ]]; then
+    log "Docker mode: yt-dlp updated: $before -> $after"
+    docker restart videodownloaderbot >/dev/null
+    log "Docker mode: restarted container videodownloaderbot"
+  else
+    log "Docker mode: yt-dlp already up to date: $after"
+  fi
+  log_runtime_status_docker
+  return 0
+}
+
+main() {
+  load_env
+  if [[ "${YTDLP_AUTO_UPDATE:-1}" == "0" ]]; then
+    log "YTDLP_AUTO_UPDATE=0 -> auto update disabled"
+    exit 0
+  fi
+
+  local ok_mode=1
+  if update_docker_mode; then
+    ok_mode=0
+  elif update_system_mode; then
+    ok_mode=0
+  fi
+
+  if [[ $ok_mode -ne 0 ]]; then
+    log "No supported runtime found (.venv or docker-compose/container)."
+    exit 0
+  fi
+}
+
+main "$@"
+SH
+
+  chmod +x "$install_dir/scripts/ytdlp-nightly-update.sh"
+  ok "Created nightly updater: $install_dir/scripts/ytdlp-nightly-update.sh"
+}
+
+setup_ytdlp_auto_update_timer() {
+  local install_dir="$1"
+
+  write_ytdlp_updater_script "$install_dir"
+
+  if ! has_systemd; then
+    warn "systemd not detected; nightly yt-dlp auto-update timer was not created."
+    return 0
+  fi
+
+  say "Creating systemd timer: videodownloaderbot-ytdlp-update.timer"
+
+  as_root tee /etc/systemd/system/videodownloaderbot-ytdlp-update.service >/dev/null <<EOF
+[Unit]
+Description=Nightly yt-dlp update for VideoDownloaderBot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$install_dir
+ExecStart=$install_dir/scripts/ytdlp-nightly-update.sh
+EOF
+
+  as_root tee /etc/systemd/system/videodownloaderbot-ytdlp-update.timer >/dev/null <<'EOF'
+[Unit]
+Description=Run nightly yt-dlp update for VideoDownloaderBot
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=2h
+Persistent=true
+Unit=videodownloaderbot-ytdlp-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now videodownloaderbot-ytdlp-update.timer
+
+  ok "Nightly yt-dlp auto-update is enabled."
+  echo "Timer status:"
+  echo "  sudo systemctl status videodownloaderbot-ytdlp-update.timer"
+  echo "Last/next runs:"
+  echo "  systemctl list-timers --all | grep videodownloaderbot-ytdlp-update"
+  echo "Manual run:"
+  echo "  sudo systemctl start videodownloaderbot-ytdlp-update.service"
 }
 
 ensure_docker_installed() {
@@ -267,7 +491,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
-      ffmpeg ca-certificates \
+      ffmpeg ca-certificates nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
@@ -317,6 +541,11 @@ install_system_mode() {
   python3 -m venv "$install_dir/.venv"
   "$install_dir/.venv/bin/pip" install --upgrade pip >/dev/null 2>&1 || true
   "$install_dir/.venv/bin/pip" install -r "$install_dir/requirements.txt"
+  if ! need_cmd node; then
+    warn "node is missing; installing nodejs for yt-dlp JS runtime..."
+    as_root apt-get update -y
+    as_root apt-get install -y --no-install-recommends nodejs
+  fi
 
   ok "Python venv ready."
 
@@ -421,6 +650,8 @@ main() {
   else
     install_system_mode "$install_dir"
   fi
+
+  setup_ytdlp_auto_update_timer "$install_dir"
 
   echo
   ok "Done."
