@@ -1,0 +1,12 @@
+[Unit]
+Description=Check origin/main for VideoDownloaderBot updates
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=2m
+RandomizedDelaySec=20s
+Persistent=true
+Unit=videodownloaderbot-deploy.service
+
+[Install]
+WantedBy=timers.target

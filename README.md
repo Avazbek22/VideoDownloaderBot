@@ -96,23 +96,22 @@ Most “download bots” are either public (unstable / rate-limited / banned), o
 Run on your Ubuntu server (SSH):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Avazbek22/VideoDownloaderBot/master/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Avazbek22/VideoDownloaderBot/main/install.sh)
 ```
 
 The installer will:
 
-* Install system deps (**Python**, **venv**, **git**, **ffmpeg**, certificates)
-* Ask only for your **Telegram bot token**
-* Ask if you want **Docker install** (recommended)
-* Start the bot and show commands to view logs / stop
+* Install **Git**, **Docker**, Compose, and `flock` when needed
+* Preserve an existing `.env`, `data/`, and `logs/`
+* Ask for **BOT_TOKEN** only when it is not configured
+* Build and validate the production image before replacing the container
+* Enable automatic deployment from `origin/main` and nightly yt-dlp image updates
 
 > No Python knowledge required. One command on a fresh Ubuntu VPS.
 
 ---
 
 ## After installation
-
-### If installed with Docker
 
 Go to the install folder printed by the script (default: `~/VideoDownloaderBot`) and use:
 
@@ -133,13 +132,15 @@ docker compose logs -f --tail=200 || docker-compose logs -f --tail=200
 (docker compose up -d || docker-compose up -d)
 ```
 
-### If installed without Docker (system service)
+Runtime logs are also written to `logs/bot.log`. Downloads use per-job directories under `data/downloads/`; both directories survive deployment and rollback.
 
-```bash
-sudo systemctl status videodownloaderbot
-sudo systemctl restart videodownloaderbot
-sudo journalctl -u videodownloaderbot -f --no-pager
-```
+### Automatic deployment and rollback
+
+`videodownloaderbot-deploy.timer` checks `origin/main` every two minutes. Runtime changes are built and tested in a new image; documentation-only commits update the checkout without rebuilding the container. Before replacement, deployment verifies Python imports, ffmpeg, Node, yt-dlp, and Telegram `getMe`.
+
+If build, preflight, container startup, or health stabilization fails, the previous Git commit and Docker image are restored. The failed SHA is stored in `data/.failed-deploy-sha` and is not retried until a newer commit arrives. Daily deployment logs are stored in `logs/deploy-YYYY-MM-DD.log` for 60 days.
+
+`videodownloaderbot-yt-dlp-update.timer` performs a nightly image rebuild using `YTDLP_CACHEBUST`. It never runs `pip install` inside the running container and rolls back to the previous image if validation or startup fails. Updater logs are stored in `logs/updater-YYYY-MM-DD.log`.
 
 ---
 
@@ -187,27 +188,28 @@ Fetches formats and lets you pick one.
 
 * `BOT_TOKEN` — Telegram bot token from BotFather
 
-### Recommended config (installer)
-
-The installer creates a local `.env` (not meant to be committed):
+The installer creates `.env` from `.env-example` only when it does not exist:
 
 ```env
 BOT_TOKEN=123456:ABCDEF...
-OUTPUT_FOLDER=/tmp/yt-dlp-telegram
+OUTPUT_FOLDER=/app/data/downloads
+LOGS_DIR=/app/logs
 ```
 
-And it generates `config.py` that reads from environment variables.
+Operational settings are read through the validated `Settings` dataclass:
 
-### Optional
-
-* `OUTPUT_FOLDER` — where temporary files are stored (default: `/tmp/yt-dlp-telegram`)
-
-### Hardcoded defaults (by design)
-
-* `logs = None`
-* `max_filesize = 50 MB`
-
-> If you really want logging to a Telegram chat/channel, set `logs` manually in `config.py`.
+* `LOGS_CHAT_ID` — optional operator chat for critical failures
+* `OUTPUT_FOLDER` — temporary per-job directories
+* `LOGS_DIR` — rotating application logs
+* `MAX_FILESIZE` — strict upload limit; defaults to `52428800` bytes (50 MiB)
+* `WORKERS` — download workers; default `2`
+* `MAX_QUEUE` — bounded queue size; default `200`
+* `UPLOAD_WORKERS` — concurrent Telegram uploads; default `2`
+* `JOB_TIMEOUT_SECONDS` — whole-job deadline; default `900`
+* `PENDING_TTL_SECONDS` — button request lifetime; default `600`
+* `YTDLP_CONCURRENT_FRAGMENTS` — segmented download concurrency; default `4`
+* `COOKIES_FILE` — optional cookies file, normally `/app/data/cookies.txt`
+* `LOG_LEVEL` — `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`
 
 ---
 
@@ -219,6 +221,7 @@ If you prefer doing everything yourself:
 sudo apt-get update -y
 sudo apt-get install -y --no-install-recommends \
   ca-certificates git python3 python3-venv python3-pip ffmpeg
+# Install Node.js 22 or newer for current yt-dlp YouTube support.
 
 git clone https://github.com/Avazbek22/VideoDownloaderBot.git
 cd VideoDownloaderBot
@@ -230,11 +233,11 @@ pip install -r requirements.txt
 # create .env
 cat > .env <<'EOF'
 BOT_TOKEN=PUT_YOUR_TOKEN_HERE
-OUTPUT_FOLDER=/tmp/yt-dlp-telegram
+OUTPUT_FOLDER=./data/downloads
+LOGS_DIR=./logs
 EOF
 
 # run
-set -a; source .env; set +a
 python -u main.py
 ```
 
@@ -243,8 +246,9 @@ python -u main.py
 ## Requirements
 
 * Ubuntu 22.04 / 24.04 (recommended)
-* Python 3.11+ (Docker uses 3.11-slim)
+* Python 3.11+ (Docker uses 3.12-slim)
 * ffmpeg
+* Node.js 22+
 * Telegram bot token
 
 Python dependencies (see `requirements.txt`):
@@ -290,7 +294,7 @@ That’s inside the container image (base `python:*‑slim` images are Debian-ba
 
 ### YouTube prints warnings about JavaScript runtime
 
-yt-dlp may warn about missing JS runtime. The bot can still work, but some formats might be missing. You can extend the Dockerfile later to include a runtime if you want.
+The production image installs a checksum-verified Node.js runtime. Check it with `docker compose exec videodownloaderbot node --version`. Manual installations require Node.js 22 or newer.
 
 ### I ran `install.sh` on Windows PowerShell and `chmod` is not found
 
@@ -325,15 +329,18 @@ Then reconnect your SSH session.
 
 ```
 .
-├── main.py              # Bot logic (queue, progress, pre-check, upload)
-├── install.sh           # One-line installer (Docker or system service)
-├── requirements.txt     # Python deps
-├── example.config.py    # Example (installer generates config.py dynamically)
+├── app/                     # Settings, planner, URL security, logging, helpers
+├── scripts/                 # Entrypoint, deploy, yt-dlp updater, systemd units
+├── tests/                   # Python and rollback shell tests
+├── main.py                  # Existing Telegram UX and application lifecycle
+├── Dockerfile
+├── docker-compose.yml
+├── install.sh               # Idempotent production installer
+├── .env-example
+├── requirements.txt
 ├── LICENSE
 └── README.md
 ```
-
-> Docker files (`Dockerfile`, `docker-compose.yml`, `docker/entrypoint.sh`) are generated by `install.sh`.
 
 ---
 
@@ -346,7 +353,7 @@ Ideas that fit this project’s philosophy:
 
 * Better format selection *without* quality squeezing
 * Better website-specific fallbacks
-* Optional JS runtime layer in Docker
+* Better website-specific runtime compatibility
 * More robust size probing for edge sites
 
 ---

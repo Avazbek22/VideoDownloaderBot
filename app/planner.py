@@ -1,23 +1,27 @@
+import logging
 import re
+from typing import Any
 from urllib.parse import urlparse
-from typing import Any, Dict, Optional, Tuple
 
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
 from app.http_utils import requests_session_with_retries
 from app.text_utils import fmt_bytes
+from app.url_security import MAX_REDIRECTS, domain_matches, validate_public_url, validate_redirect
 
 AUDIO_HEADROOM_BYTES = 1_500_000
+LOGGER = logging.getLogger(__name__)
 
 
 def is_youtube_url(url: str) -> bool:
     try:
         host = (urlparse(url).netloc or "").lower()
     except Exception:
+        LOGGER.debug("failed to parse URL while checking YouTube domain", exc_info=True)
         return False
     return any(
-        x in host
+        domain_matches(host, x)
         for x in (
             "youtube.com",
             "youtu.be",
@@ -30,9 +34,10 @@ def is_instagram_url(url: str) -> bool:
     try:
         host = (urlparse(url).netloc or "").lower()
     except Exception:
+        LOGGER.debug("failed to parse URL while checking Instagram domain", exc_info=True)
         return False
     return any(
-        x in host
+        domain_matches(host, x)
         for x in (
             "instagram.com",
             "instagr.am",
@@ -41,15 +46,15 @@ def is_instagram_url(url: str) -> bool:
 
 
 def apply_youtube_runtime_opts(
-    opts: Dict[str, Any],
+    opts: dict[str, Any],
     url: str,
-    js_runtimes: Optional[str],
-    remote_components: Optional[str],
-) -> Dict[str, Any]:
+    js_runtimes: str | None,
+    remote_components: str | None,
+) -> dict[str, Any]:
     if not is_youtube_url(url):
         return opts
     if js_runtimes:
-        parsed: Dict[str, Dict[str, str]] = {}
+        parsed: dict[str, dict[str, str]] = {}
         for raw in str(js_runtimes).split(","):
             item = raw.strip()
             if not item:
@@ -58,7 +63,7 @@ def apply_youtube_runtime_opts(
             runtime = runtime.strip().lower()
             if not runtime:
                 continue
-            conf: Dict[str, str] = {}
+            conf: dict[str, str] = {}
             if path.strip():
                 conf["path"] = path.strip()
             parsed[runtime] = conf
@@ -72,13 +77,13 @@ def apply_youtube_runtime_opts(
 
 
 def apply_instagram_stability_opts(
-    opts: Dict[str, Any],
+    opts: dict[str, Any],
     url: str,
-    impersonate: Optional[str],
-    retries: Optional[int],
-    fragment_retries: Optional[int],
-    socket_timeout: Optional[int],
-) -> Dict[str, Any]:
+    impersonate: str | None,
+    retries: int | None,
+    fragment_retries: int | None,
+    socket_timeout: int | None,
+) -> dict[str, Any]:
     if not is_instagram_url(url):
         return opts
     if impersonate:
@@ -88,7 +93,7 @@ def apply_instagram_stability_opts(
                 opts["impersonate"] = ImpersonateTarget.from_str(imp)
             except Exception:
                 # If parsing fails, keep working without forced impersonation.
-                pass
+                LOGGER.debug("invalid yt-dlp impersonation target=%s", imp, exc_info=True)
     if isinstance(retries, int) and retries > 0:
         opts["retries"] = retries
     if isinstance(fragment_retries, int) and fragment_retries > 0:
@@ -98,7 +103,7 @@ def apply_instagram_stability_opts(
     return opts
 
 
-def probe_url_size_bytes(url: str, timeout_sec: int = 10) -> Optional[int]:
+def probe_url_size_bytes(url: str, timeout_sec: int = 10) -> int | None:
     """
     Try to get real content size without downloading the file:
     - Send GET with Range: bytes=0-0
@@ -109,13 +114,26 @@ def probe_url_size_bytes(url: str, timeout_sec: int = 10) -> Optional[int]:
 
     s = requests_session_with_retries()
     try:
-        resp = s.get(
-            url,
-            headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"},
-            stream=True,
-            timeout=(timeout_sec, timeout_sec),
-            allow_redirects=True,
-        )
+        current_url = validate_public_url(url)
+        resp = None
+        for _ in range(MAX_REDIRECTS + 1):
+            resp = s.get(
+                current_url,
+                headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"},
+                stream=True,
+                timeout=(timeout_sec, timeout_sec),
+                allow_redirects=False,
+            )
+            if resp.is_redirect or resp.is_permanent_redirect:
+                next_url = validate_redirect(current_url, resp.headers.get("Location", ""))
+                resp.close()
+                current_url = next_url
+                continue
+            break
+        else:
+            return None
+        if resp is None or resp.is_redirect or resp.is_permanent_redirect:
+            return None
         cr = resp.headers.get("Content-Range") or resp.headers.get("content-range")
         if cr:
             m = re.search(r"/(\d+)\s*$", cr.strip())
@@ -134,24 +152,25 @@ def probe_url_size_bytes(url: str, timeout_sec: int = 10) -> Optional[int]:
 
         return None
     except Exception:
+        LOGGER.debug("size probe failed url=%s", url, exc_info=True)
         return None
     finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        s.close()
 
 
 def get_video_meta(
     url: str,
-    js_runtimes: Optional[str] = None,
-    remote_components: Optional[str] = None,
-    instagram_impersonate: Optional[str] = None,
-    instagram_retries: Optional[int] = None,
-    instagram_fragment_retries: Optional[int] = None,
-    instagram_socket_timeout: Optional[int] = None,
-) -> Dict[str, Any]:
-    ydl_opts: Dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    js_runtimes: str | None = None,
+    remote_components: str | None = None,
+    instagram_impersonate: str | None = None,
+    instagram_retries: int | None = None,
+    instagram_fragment_retries: int | None = None,
+    instagram_socket_timeout: int | None = None,
+    cookies_file: str | None = None,
+) -> dict[str, Any]:
+    ydl_opts: dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
     ydl_opts = apply_youtube_runtime_opts(ydl_opts, url, js_runtimes, remote_components)
     ydl_opts = apply_instagram_stability_opts(
         ydl_opts,
@@ -165,14 +184,14 @@ def get_video_meta(
         return ydl.extract_info(url, download=False)
 
 
-def _duration_sec(meta: Dict[str, Any]) -> Optional[int]:
+def _duration_sec(meta: dict[str, Any]) -> int | None:
     dur = meta.get("duration")
     if isinstance(dur, (int, float)) and dur > 0:
         return int(dur)
     return None
 
 
-def _format_size_bytes(fmt: Dict[str, Any], dur: Optional[int]) -> Tuple[Optional[int], bool]:
+def _format_size_bytes(fmt: dict[str, Any], dur: int | None) -> tuple[int | None, bool]:
     """
     Returns (size_bytes, confident).
     confident=True when size comes from 'filesize' or 'filesize_approx' or URL probe.
@@ -195,7 +214,7 @@ def _format_size_bytes(fmt: Dict[str, Any], dur: Optional[int]) -> Tuple[Optiona
     return None, False
 
 
-def _best_progressive_mp4(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _best_progressive_mp4(meta: dict[str, Any]) -> dict[str, Any] | None:
     """
     Pick the best progressive MP4 (video+audio in one file), no limit filtering.
     """
@@ -230,7 +249,7 @@ def _best_progressive_mp4(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return best
 
 
-def _best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _best_separate_mp4_m4a(meta: dict[str, Any]) -> dict[str, Any] | None:
     """
     Pick best mp4 video-only + best m4a audio-only, no limit filtering.
     """
@@ -296,7 +315,7 @@ def _best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def build_video_plan_no_squeeze(meta: Dict[str, Any]) -> Dict[str, Any]:
+def build_video_plan_no_squeeze(meta: dict[str, Any]) -> dict[str, Any]:
     """
     Build a video plan without reducing quality.
     We will NOT download unless we can confidently prove size <= limit.
@@ -321,7 +340,7 @@ def build_video_plan_no_squeeze(meta: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def apply_probe_if_needed(plan: Dict[str, Any]) -> Dict[str, Any]:
+def apply_probe_if_needed(plan: dict[str, Any]) -> dict[str, Any]:
     """
     If plan does not have confident size, try probing direct URLs (Range request).
     If we can probe all URLs -> confident total.
@@ -348,7 +367,7 @@ def apply_probe_if_needed(plan: Dict[str, Any]) -> Dict[str, Any]:
     return plan
 
 
-def build_audio_plan_mp3(meta: Dict[str, Any], limit_bytes: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def build_audio_plan_mp3(meta: dict[str, Any], limit_bytes: int) -> tuple[dict[str, Any] | None, str | None]:
     """
     Audio is allowed only if we can confidently keep MP3 under the limit.
     We compute it from duration and pick a bitrate that fits with headroom.

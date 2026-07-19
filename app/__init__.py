@@ -1,2 +1,1 @@
 """Application modules for VideoDownloaderBot."""
-

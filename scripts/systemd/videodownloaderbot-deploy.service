@@ -1,0 +1,16 @@
+[Unit]
+Description=Deploy VideoDownloaderBot from origin/main
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__INSTALL_DIR__
+Environment=ROOT_DIR=__INSTALL_DIR__
+Environment=COMPOSE_PROJECT=__COMPOSE_PROJECT__
+Environment=SERVICE_KEY=__SERVICE_KEY__
+ExecStart=/usr/bin/env bash __INSTALL_DIR__/scripts/deploy.sh
+
+[Install]
+WantedBy=multi-user.target
