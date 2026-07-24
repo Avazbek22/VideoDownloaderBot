@@ -6,6 +6,12 @@ DEFAULT_REPOSITORY="https://github.com/Avazbek22/VideoDownloaderBot.git"
 BRANCH="main"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-videodownloaderbot}"
 SERVICE_KEY="videodownloaderbot"
+DOCKER_WITH_SUDO=0
+previous_commit=""
+previous_image=0
+previous_running=0
+transaction_started=0
+replacement_attempted=0
 
 if [[ -d "$SCRIPT_DIR/.git" ]]; then
   INSTALL_DIR="${INSTALL_DIR:-$SCRIPT_DIR}"
@@ -24,7 +30,22 @@ ok() { printf '\033[32m✓\033[0m %s\n' "$*"; }
 die() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1; }
 as_root() { if [[ "$(id -u)" == "0" ]]; then "$@"; else need sudo || die "sudo is required"; sudo "$@"; fi; }
-compose() { if docker compose version >/dev/null 2>&1; then docker compose "$@"; else docker-compose "$@"; fi; }
+docker_cmd() {
+  if [[ "$DOCKER_WITH_SUDO" == "1" ]]; then
+    sudo docker "$@"
+  else
+    docker "$@"
+  fi
+}
+compose() {
+  if docker_cmd compose version >/dev/null 2>&1; then
+    docker_cmd compose "$@"
+  elif [[ "$DOCKER_WITH_SUDO" == "1" ]]; then
+    sudo docker-compose "$@"
+  else
+    docker-compose "$@"
+  fi
+}
 
 install_prerequisites() {
   info "Installing production prerequisites"
@@ -35,13 +56,63 @@ install_prerequisites() {
     need docker || as_root apt-get install -y --no-install-recommends docker.io
     need flock || as_root apt-get install -y --no-install-recommends util-linux
   fi
-  if ! docker compose version >/dev/null 2>&1 && ! need docker-compose; then
+  if need systemctl; then
+    as_root systemctl enable --now docker
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    need sudo || die "Current user cannot access the Docker daemon and sudo is unavailable"
+    sudo docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
+    DOCKER_WITH_SUDO=1
+  fi
+  if ! docker_cmd compose version >/dev/null 2>&1 && ! need docker-compose; then
     if ! as_root apt-get install -y --no-install-recommends docker-compose-plugin; then
       as_root apt-get install -y --no-install-recommends docker-compose
     fi
   fi
-  (docker compose version >/dev/null 2>&1 || need docker-compose) || die "Docker Compose is unavailable"
+  (docker_cmd compose version >/dev/null 2>&1 || need docker-compose) || die "Docker Compose is unavailable"
   ok "Docker production prerequisites are ready"
+}
+
+capture_previous_state() {
+  [[ -d "$INSTALL_DIR/.git" ]] || return 0
+  previous_commit="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
+  if docker_cmd image inspect videodownloaderbot:local >/dev/null 2>&1; then
+    docker_cmd image tag videodownloaderbot:local videodownloaderbot:install-rollback
+    previous_image=1
+  fi
+  local container_id
+  container_id="$(compose -p "$COMPOSE_PROJECT" -f "$INSTALL_DIR/docker-compose.yml" ps -q "$SERVICE_KEY")"
+  if [[ -n "$container_id" ]] \
+    && [[ "$(docker_cmd inspect --format '{{.State.Running}}' "$container_id")" == "true" ]]; then
+    previous_running=1
+  fi
+  transaction_started=1
+}
+
+rollback_install() {
+  local code=$?
+  [[ "$code" -ne 0 ]] || code=1
+  trap - ERR INT TERM EXIT
+  if [[ "$transaction_started" == "1" ]]; then
+    info "Installation failed; restoring the previous deployment"
+    if [[ -n "$previous_commit" ]]; then
+      if ! git -C "$INSTALL_DIR" checkout -q -B "$BRANCH" "$previous_commit"; then
+        printf 'Failed to restore Git commit %s\n' "$previous_commit" >&2
+      fi
+    fi
+    if [[ "$previous_image" == "1" ]]; then
+      if ! docker_cmd image tag videodownloaderbot:install-rollback videodownloaderbot:local; then
+        printf 'Failed to restore Docker image\n' >&2
+      fi
+    fi
+    if [[ "$previous_running" == "1" && "$replacement_attempted" == "1" ]]; then
+      if ! compose -p "$COMPOSE_PROJECT" -f "$INSTALL_DIR/docker-compose.yml" \
+        up -d --no-deps --force-recreate "$SERVICE_KEY"; then
+        printf 'Failed to restore previous container\n' >&2
+      fi
+    fi
+  fi
+  exit "$code"
 }
 
 prepare_repository() {
@@ -86,13 +157,19 @@ prepare_environment() {
 }
 
 wait_until_healthy() {
-  local id running health attempt
+  local id running health attempt stable=0
   for ((attempt = 1; attempt <= 30; attempt++)); do
     id="$(compose -p "$COMPOSE_PROJECT" -f "$INSTALL_DIR/docker-compose.yml" ps -q "$SERVICE_KEY")"
     if [[ -n "$id" ]]; then
-      running="$(docker inspect --format '{{.State.Running}}' "$id")"
-      health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id")"
-      if [[ "$running" == "true" && ( "$health" == "healthy" || "$health" == "none" ) ]]; then return 0; fi
+      running="$(docker_cmd inspect --format '{{.State.Running}}' "$id")"
+      health="$(docker_cmd inspect --format \
+        '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id")"
+      if [[ "$running" == "true" && "$health" == "healthy" ]]; then
+        stable=$((stable + 1))
+        [[ "$stable" -ge 5 ]] && return 0
+      else
+        stable=0
+      fi
     fi
     sleep 2
   done
@@ -102,8 +179,8 @@ wait_until_healthy() {
 start_bot() {
   info "Building and validating the production image"
   cd "$INSTALL_DIR"
-  if docker image inspect videodownloaderbot:local >/dev/null 2>&1; then
-    docker image tag videodownloaderbot:local videodownloaderbot:rollback
+  if docker_cmd image inspect videodownloaderbot:local >/dev/null 2>&1; then
+    docker_cmd image tag videodownloaderbot:local videodownloaderbot:rollback
   fi
   compose -p "$COMPOSE_PROJECT" build --pull "$SERVICE_KEY"
   compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" sh -ec '
@@ -113,6 +190,7 @@ start_bot() {
     python -m yt_dlp --version >/dev/null
     python -c "import telebot; from app.settings import load_settings; telebot.TeleBot(load_settings().token).get_me()"
   '
+  replacement_attempted=1
   compose -p "$COMPOSE_PROJECT" up -d --no-deps --force-recreate "$SERVICE_KEY"
   wait_until_healthy || die "Container did not reach a stable healthy state"
   ok "VideoDownloaderBot is healthy"
@@ -140,10 +218,18 @@ install_systemd_units() {
 
 main() {
   install_prerequisites
+  if [[ -d "$INSTALL_DIR/.git" ]] \
+    && [[ -n "$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=no)" ]]; then
+    die "Tracked local changes detected in $INSTALL_DIR"
+  fi
+  capture_previous_state
+  trap rollback_install ERR INT TERM EXIT
   prepare_repository
   prepare_environment
   start_bot
   install_systemd_units
+  transaction_started=0
+  trap - ERR INT TERM EXIT
   printf '\nLogs: cd %q && docker compose -p %q logs -f --tail=200\n' "$INSTALL_DIR" "$COMPOSE_PROJECT"
 }
 

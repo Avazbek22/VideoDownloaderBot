@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import main
-from app.models import ActiveJob, PendingRequest
+from app.models import ActiveJob, PendingRequest, VideoFormatCandidate
 from app.settings import Settings
 
 
@@ -52,8 +52,19 @@ def prepare_request(tmp_path, monkeypatch, max_queue=2):
         11,
         "https://example.com/video",
         "Title",
-        {"format_spec": "18"},
+        (
+            VideoFormatCandidate(
+                format_spec="18",
+                merge_output_format=None,
+                estimated_size=1,
+                estimated_confident=True,
+                quality_label="360p",
+                compatibility=2,
+                direct_urls=(),
+            ),
+        ),
         None,
+        {},
     )
     monkeypatch.setattr(main, "_safe_answer_callback", lambda *_a, **_kw: None)
     monkeypatch.setattr(main, "_safe_edit", lambda *_a, **_kw: None)
@@ -84,8 +95,9 @@ def test_pending_ttl_cleanup(tmp_path) -> None:
         1,
         "https://example.com",
         "Title",
+        (),
         None,
-        None,
+        {},
     )
     main._cleanup_pending()
     assert "old" not in main.pending_requests

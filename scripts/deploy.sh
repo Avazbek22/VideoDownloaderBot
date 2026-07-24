@@ -2,6 +2,9 @@
 set -Eeuo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib-production.sh
+source "$SCRIPT_DIR/lib-production.sh"
 DEPLOY_BRANCH="main"
 SERVICE_KEY="${SERVICE_KEY:-videodownloaderbot}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-videodownloaderbot}"
@@ -14,32 +17,12 @@ old_commit=""
 target_commit=""
 deployment_started=0
 replacement_attempted=0
+units_changed=0
+units_backup=""
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 
 log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
-
-compose() {
-  if docker compose version >/dev/null 2>&1; then docker compose "$@"; else docker-compose "$@"; fi
-}
-
-wait_until_stable() {
-  local container_id running restarts health attempt stable=0
-  for ((attempt = 1; attempt <= 30; attempt++)); do
-    container_id="$(compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" ps -q "$SERVICE_KEY")"
-    if [[ -n "$container_id" ]]; then
-      running="$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null || printf false)"
-      restarts="$(docker inspect --format '{{.RestartCount}}' "$container_id" 2>/dev/null || printf 999)"
-      health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" 2>/dev/null || printf unknown)"
-      if [[ "$running" == "true" && "$restarts" == "0" && ( "$health" == "healthy" || "$health" == "none" ) ]]; then
-        stable=$((stable + 1))
-        [[ "$stable" -ge 5 ]] && return 0
-      else
-        stable=0
-      fi
-    fi
-    sleep 2
-  done
-  return 1
-}
 
 rollback() {
   local code=$?
@@ -51,6 +34,9 @@ rollback() {
       docker image tag "$ROLLBACK_IMAGE" "$IMAGE_NAME" || log "failed to restore rollback image tag"
     fi
     git -C "$ROOT_DIR" checkout -q -B "$DEPLOY_BRANCH" "$old_commit" || log "failed to restore checkout"
+    if [[ "$units_changed" == "1" ]]; then
+      restore_systemd_units || log "failed to restore previous systemd units"
+    fi
     if [[ "$replacement_attempted" == "1" ]]; then
       compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" \
         up -d --no-deps --force-recreate "$SERVICE_KEY" || log "failed to recreate rollback container"
@@ -58,6 +44,63 @@ rollback() {
     printf '%s\n' "$target_commit" >"$FAILED_SHA_FILE"
   fi
   exit "$code"
+}
+
+unit_names=(
+  videodownloaderbot-deploy.service
+  videodownloaderbot-deploy.timer
+  videodownloaderbot-yt-dlp-update.service
+  videodownloaderbot-yt-dlp-update.timer
+)
+
+backup_systemd_units() {
+  local unit
+  units_backup="$(mktemp -d)"
+  for unit in "${unit_names[@]}"; do
+    if [[ -f "$SYSTEMD_DIR/$unit" ]]; then
+      cp "$SYSTEMD_DIR/$unit" "$units_backup/$unit"
+    else
+      : >"$units_backup/$unit.absent"
+    fi
+  done
+}
+
+install_systemd_units() {
+  local unit source target
+  mkdir -p "$SYSTEMD_DIR"
+  for unit in videodownloaderbot-deploy.service videodownloaderbot-yt-dlp-update.service; do
+    source="$ROOT_DIR/scripts/systemd/$unit"
+    target="$SYSTEMD_DIR/$unit"
+    sed -e "s|__INSTALL_DIR__|$ROOT_DIR|g" \
+      -e "s|__COMPOSE_PROJECT__|$COMPOSE_PROJECT|g" \
+      -e "s|__SERVICE_KEY__|$SERVICE_KEY|g" "$source" >"$target"
+  done
+  for unit in videodownloaderbot-deploy.timer videodownloaderbot-yt-dlp-update.timer; do
+    cp "$ROOT_DIR/scripts/systemd/$unit" "$SYSTEMD_DIR/$unit"
+  done
+  "$SYSTEMCTL" daemon-reload
+  "$SYSTEMCTL" enable videodownloaderbot-deploy.timer videodownloaderbot-yt-dlp-update.timer
+}
+
+restore_systemd_units() {
+  local unit
+  for unit in "${unit_names[@]}"; do
+    if [[ -f "$units_backup/$unit.absent" ]]; then
+      rm -f "$SYSTEMD_DIR/$unit"
+    else
+      cp "$units_backup/$unit" "$SYSTEMD_DIR/$unit"
+    fi
+  done
+  "$SYSTEMCTL" daemon-reload
+}
+
+cleanup_units_backup() {
+  local unit
+  [[ -n "$units_backup" && -d "$units_backup" ]] || return 0
+  for unit in "${unit_names[@]}"; do
+    rm -f "$units_backup/$unit" "$units_backup/$unit.absent"
+  done
+  rmdir "$units_backup"
 }
 
 validate_checkout() {
@@ -79,16 +122,6 @@ requires_container_update() {
     esac
   done < <(git diff --name-only --diff-filter=ACDMRTUXB "$old_commit" "$target_commit")
   return 1
-}
-
-smoke_test_image() {
-  compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" run --rm --no-deps "$SERVICE_KEY" sh -ec '
-    python -c "import main"
-    ffmpeg -version >/dev/null
-    node --version >/dev/null
-    python -m yt_dlp --version >/dev/null
-    python -c "import telebot; from app.settings import load_settings; telebot.TeleBot(load_settings().token).get_me()"
-  '
 }
 
 main() {
@@ -129,7 +162,15 @@ main() {
   deployment_started=1
   trap rollback ERR INT TERM
 
+  if git diff --name-only "$old_commit" "$target_commit" -- scripts/systemd |
+    grep -q '^scripts/systemd/'; then
+    units_changed=1
+    backup_systemd_units
+  fi
   git checkout -q -B "$DEPLOY_BRANCH" "$target_commit"
+  if [[ "$units_changed" == "1" ]]; then
+    install_systemd_units
+  fi
   compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" build --pull "$SERVICE_KEY"
   smoke_test_image
   replacement_attempted=1
@@ -140,6 +181,7 @@ main() {
   rm -f "$FAILED_SHA_FILE"
   deployment_started=0
   trap - ERR INT TERM
+  cleanup_units_backup
   log "deployment successful commit=$target_commit"
 }
 

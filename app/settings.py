@@ -48,6 +48,14 @@ class Settings:
     concurrent_fragments: int
     cookies_file: Path | None
     log_level: str
+    ytdlp_js_runtimes: str = "node"
+    ytdlp_remote_components: str = ""
+    ytdlp_instagram_impersonate: str | None = "chrome"
+    ytdlp_instagram_retries: int = 8
+    ytdlp_instagram_fragment_retries: int = 8
+    ytdlp_instagram_socket_timeout: int = 30
+    metadata_workers: int = 2
+    metadata_timeout_seconds: int = 60
 
 
 def load_settings(base_dir: Path | None = None) -> Settings:
@@ -72,6 +80,9 @@ def load_settings(base_dir: Path | None = None) -> Settings:
     log_level = (os.getenv("LOG_LEVEL") or "INFO").strip().upper()
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise RuntimeError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+    js_runtimes = (os.getenv("YTDLP_JS_RUNTIMES") or "node").strip()
+    remote_components = (os.getenv("YTDLP_REMOTE_COMPONENTS") or "").strip()
+    instagram_impersonate = (os.getenv("YTDLP_INSTAGRAM_IMPERSONATE") or "").strip() or None
 
     return Settings(
         token=token,
@@ -87,4 +98,12 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         concurrent_fragments=_integer("YTDLP_CONCURRENT_FRAGMENTS", 4, 1, 32),
         cookies_file=Path(cookies_raw).expanduser().resolve() if cookies_raw else None,
         log_level=log_level,
+        ytdlp_js_runtimes=js_runtimes,
+        ytdlp_remote_components=remote_components,
+        ytdlp_instagram_impersonate=instagram_impersonate,
+        ytdlp_instagram_retries=_integer("YTDLP_INSTAGRAM_RETRIES", 8, 0, 50),
+        ytdlp_instagram_fragment_retries=_integer("YTDLP_INSTAGRAM_FRAGMENT_RETRIES", 8, 0, 50),
+        ytdlp_instagram_socket_timeout=_integer("YTDLP_INSTAGRAM_SOCKET_TIMEOUT", 30, 1, 300),
+        metadata_workers=_integer("METADATA_WORKERS", 2, 1, 16),
+        metadata_timeout_seconds=_integer("METADATA_TIMEOUT_SECONDS", 60, 5, 600),
     )

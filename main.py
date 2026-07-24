@@ -8,6 +8,8 @@ import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlsplit
@@ -30,14 +32,13 @@ from app.download_utils import (
 from app.download_utils import (
     render_status as _render_status,
 )
+from app.healthcheck import HEALTH_MARKER
 from app.http_utils import telegram_upload_session
 from app.logging_setup import configure_logging
-from app.models import ActiveJob, DownloadJob, PendingRequest
+from app.media_validation import validate_media_file
+from app.models import ActiveJob, DownloadJob, PendingRequest, VideoFormatCandidate
 from app.planner import (
     apply_instagram_stability_opts as _apply_instagram_stability_opts,
-)
-from app.planner import (
-    apply_probe_if_needed as _apply_probe_if_needed,
 )
 from app.planner import (
     apply_youtube_runtime_opts as _apply_youtube_runtime_opts,
@@ -45,20 +46,16 @@ from app.planner import (
 from app.planner import (
     build_audio_plan_mp3 as _build_audio_plan_mp3,
 )
-from app.planner import (
-    build_video_plan_no_squeeze as _build_video_plan_no_squeeze,
-)
+from app.planner import build_video_candidates as _build_video_candidates
 from app.planner import (
     get_video_meta as _get_video_meta,
 )
 from app.planner import (
     is_instagram_url as _is_instagram_url,
 )
-from app.planner import (
-    is_youtube_url as _is_youtube_url,
-)
+from app.planner import metadata_without_format_selection as _metadata_without_format_selection
 from app.settings import Settings, load_settings
-from app.temp_files import cleanup_job_directory, cleanup_stale_directories
+from app.temp_files import cleanup_directory_contents, cleanup_job_directory, cleanup_stale_directories
 from app.text_utils import (
     extract_first_url as _extract_first_url,
 )
@@ -97,14 +94,6 @@ MAX_SEND_BYTES = 50 * 1024 * 1024
 
 # yt-dlp optimization for segmented streams (HLS/DASH)
 YTDLP_CONCURRENT_FRAGMENTS = 4
-# YouTube JS challenge runtime settings (stable defaults, no account/cookies required)
-YTDLP_JS_RUNTIMES = (os.getenv("YTDLP_JS_RUNTIMES") or "node").strip() or "node"
-YTDLP_REMOTE_COMPONENTS = (os.getenv("YTDLP_REMOTE_COMPONENTS") or "ejs:github").strip() or "ejs:github"
-# Instagram stability profile (no account/cookies required)
-YTDLP_INSTAGRAM_IMPERSONATE = (os.getenv("YTDLP_INSTAGRAM_IMPERSONATE") or "chrome").strip() or "chrome"
-YTDLP_INSTAGRAM_RETRIES = int(os.getenv("YTDLP_INSTAGRAM_RETRIES") or "8")
-YTDLP_INSTAGRAM_FRAGMENT_RETRIES = int(os.getenv("YTDLP_INSTAGRAM_FRAGMENT_RETRIES") or "8")
-YTDLP_INSTAGRAM_SOCKET_TIMEOUT = int(os.getenv("YTDLP_INSTAGRAM_SOCKET_TIMEOUT") or "30")
 
 
 # =========================
@@ -126,6 +115,11 @@ active_jobs: dict[str, ActiveJob] = {}
 worker_threads: list[threading.Thread] = []
 maintenance_thread: threading.Thread | None = None
 upload_slots = threading.BoundedSemaphore(2)
+metadata_slots = threading.BoundedSemaphore(2)
+metadata_executor: ThreadPoolExecutor | None = None
+maintenance_finished = threading.Event()
+fatal_lifecycle_error = threading.Event()
+worker_failure_alerted = threading.Event()
 
 
 class JobCancelled(RuntimeError):
@@ -361,16 +355,17 @@ def _find_downloaded_file(
 
 
 def _get_video_meta_with_hidden_retries(url: str) -> dict[str, Any]:
+    settings = _settings()
     try:
         meta = _get_video_meta(
             url,
-            js_runtimes=YTDLP_JS_RUNTIMES,
-            remote_components=YTDLP_REMOTE_COMPONENTS,
-            instagram_impersonate=YTDLP_INSTAGRAM_IMPERSONATE,
-            instagram_retries=YTDLP_INSTAGRAM_RETRIES,
-            instagram_fragment_retries=YTDLP_INSTAGRAM_FRAGMENT_RETRIES,
-            instagram_socket_timeout=YTDLP_INSTAGRAM_SOCKET_TIMEOUT,
-            cookies_file=str(_settings().cookies_file) if _settings().cookies_file else None,
+            js_runtimes=settings.ytdlp_js_runtimes,
+            remote_components=settings.ytdlp_remote_components,
+            instagram_impersonate=settings.ytdlp_instagram_impersonate,
+            instagram_retries=settings.ytdlp_instagram_retries,
+            instagram_fragment_retries=settings.ytdlp_instagram_fragment_retries,
+            instagram_socket_timeout=settings.ytdlp_instagram_socket_timeout,
+            cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
         )
         _validate_metadata_urls(meta)
         return meta
@@ -381,16 +376,45 @@ def _get_video_meta_with_hidden_retries(url: str) -> dict[str, Any]:
         # Fallback: retry without forced impersonation.
         meta = _get_video_meta(
             url,
-            js_runtimes=YTDLP_JS_RUNTIMES,
-            remote_components=YTDLP_REMOTE_COMPONENTS,
+            js_runtimes=settings.ytdlp_js_runtimes,
+            remote_components=settings.ytdlp_remote_components,
             instagram_impersonate=None,
             instagram_retries=5,
             instagram_fragment_retries=5,
             instagram_socket_timeout=20,
-            cookies_file=str(_settings().cookies_file) if _settings().cookies_file else None,
+            cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
         )
         _validate_metadata_urls(meta)
         return meta
+
+
+class MetadataBusy(RuntimeError):
+    pass
+
+
+class MetadataTimedOut(RuntimeError):
+    pass
+
+
+def _run_metadata_operation(url: str) -> dict[str, Any]:
+    executor = metadata_executor
+    if executor is None:
+        raise RuntimeError("metadata executor is not initialized")
+    if not metadata_slots.acquire(blocking=False):
+        raise MetadataBusy("metadata capacity is full")
+
+    def run() -> dict[str, Any]:
+        try:
+            return _get_video_meta_with_hidden_retries(url)
+        finally:
+            metadata_slots.release()
+
+    future = executor.submit(run)
+    try:
+        return future.result(timeout=_settings().metadata_timeout_seconds)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise MetadataTimedOut("metadata extraction timed out") from exc
 
 
 def _validate_metadata_urls(meta: dict[str, Any]) -> None:
@@ -419,7 +443,6 @@ def _download_and_send(job: DownloadJob) -> None:
     url = job.url
     mode = job.mode
     title = job.title
-    plan = job.plan
     deadline = job.deadline
 
     job_dir = _output_folder() / job_id
@@ -438,87 +461,83 @@ def _download_and_send(job: DownloadJob) -> None:
             cancel_events.pop(job_id, None)
             active_jobs.pop(job_id, None)
         return
-    tmp_id = uuid.uuid4().hex
-    outtmpl = os.fspath(job_dir / f"{tmp_id}.%(ext)s")
+    file_path: str | None = None
+    settings = _settings()
 
-    progress_state: dict[str, Any] = {"pct": 0}
+    def build_options(plan: VideoFormatCandidate | dict[str, Any], tmp_id: str) -> dict[str, Any]:
+        progress_state: dict[str, Any] = {"pct": 0}
 
-    def progress_hook(d: dict[str, Any]):
-        _check_job(job_id, deadline)
-
-        # Track only our real output file to avoid fake 100% flashes
-        fn = d.get("filename") or d.get("tmpfilename") or ""
-        if fn and tmp_id not in os.path.basename(fn):
-            return
-
-        if d.get("status") == "downloading":
-            pct, done_b, total_b = _calc_download_progress(d, progress_state)
-
-            # Safety: if yt-dlp reveals a hard total size > limit, abort immediately
-            hard_total = d.get("total_bytes")
-            if isinstance(hard_total, int) and hard_total > MAX_SEND_BYTES and mode != "audio":
-                raise RuntimeError(
-                    f"This video is too large: {_fmt_bytes(hard_total)} > limit {_fmt_bytes(MAX_SEND_BYTES)}"
+        def progress_hook(data: dict[str, Any]) -> None:
+            _check_job(job_id, deadline)
+            filename = data.get("filename") or data.get("tmpfilename") or ""
+            if filename and tmp_id not in os.path.basename(filename):
+                return
+            if data.get("status") == "downloading":
+                pct, done_bytes, total_bytes = _calc_download_progress(data, progress_state)
+                hard_total = data.get("total_bytes")
+                if isinstance(hard_total, int) and hard_total > MAX_SEND_BYTES and mode != "audio":
+                    raise RuntimeError("download exceeded the preflight size limit")
+                _safe_edit(
+                    chat_id,
+                    status_message_id,
+                    _render_status(title, "downloading", pct, done_bytes, total_bytes),
+                    reply_markup=_cancel_markup(job_id),
+                )
+            elif data.get("status") == "finished":
+                progress_state["pct"] = 100
+                _safe_edit(
+                    chat_id,
+                    status_message_id,
+                    _render_status(title, "downloading", 100, None, None),
+                    reply_markup=_cancel_markup(job_id),
+                    force=True,
                 )
 
-            _safe_edit(
-                chat_id,
-                status_message_id,
-                _render_status(title, "downloading", pct, done_b, total_b),
-                reply_markup=_cancel_markup(job_id),
-            )
+        options: dict[str, Any] = {
+            "format": str(plan.get("format_spec", "best")),
+            "outtmpl": os.fspath(job_dir / f"{tmp_id}.%(ext)s"),
+            "progress_hooks": [progress_hook],
+            "max_filesize": MAX_SEND_BYTES,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "concurrent_fragment_downloads": settings.concurrent_fragments,
+            "retries": 5,
+            "fragment_retries": 5,
+            "socket_timeout": 20,
+            "postprocessor_hooks": [lambda _status: _check_job(job_id, deadline)],
+        }
+        if settings.cookies_file:
+            options["cookiefile"] = os.fspath(settings.cookies_file)
+        _apply_youtube_runtime_opts(
+            options,
+            url,
+            settings.ytdlp_js_runtimes,
+            settings.ytdlp_remote_components,
+        )
+        _apply_instagram_stability_opts(
+            options,
+            url,
+            impersonate=settings.ytdlp_instagram_impersonate,
+            retries=settings.ytdlp_instagram_retries,
+            fragment_retries=settings.ytdlp_instagram_fragment_retries,
+            socket_timeout=settings.ytdlp_instagram_socket_timeout,
+        )
+        if plan.get("merge_output_format"):
+            options["merge_output_format"] = str(plan["merge_output_format"])
+        if mode == "audio":
+            options["postprocessors"] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": str(int(plan.get("mp3_kbps", 128))),
+                }
+            ]
+        return options
 
-        elif d.get("status") == "finished":
-            progress_state["pct"] = 100
-            _safe_edit(
-                chat_id,
-                status_message_id,
-                _render_status(title, "downloading", 100, None, None),
-                reply_markup=_cancel_markup(job_id),
-                force=True,
-            )
-
-    ydl_opts: dict[str, Any] = {
-        "format": str(plan.get("format_spec", "best")),
-        "outtmpl": outtmpl,
-        "progress_hooks": [progress_hook],
-        "max_filesize": MAX_SEND_BYTES,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "concurrent_fragment_downloads": YTDLP_CONCURRENT_FRAGMENTS,
-        "retries": 5,
-        "fragment_retries": 5,
-        "socket_timeout": 20,
-        "postprocessor_hooks": [lambda _status: _check_job(job_id, deadline)],
-    }
-    if _settings().cookies_file:
-        ydl_opts["cookiefile"] = os.fspath(_settings().cookies_file)
-    ydl_opts = _apply_youtube_runtime_opts(ydl_opts, url, YTDLP_JS_RUNTIMES, YTDLP_REMOTE_COMPONENTS)
-    ydl_opts = _apply_instagram_stability_opts(
-        ydl_opts,
-        url,
-        impersonate=YTDLP_INSTAGRAM_IMPERSONATE,
-        retries=YTDLP_INSTAGRAM_RETRIES,
-        fragment_retries=YTDLP_INSTAGRAM_FRAGMENT_RETRIES,
-        socket_timeout=YTDLP_INSTAGRAM_SOCKET_TIMEOUT,
+    plans: list[VideoFormatCandidate | dict[str, Any]] = (
+        ([job.audio_plan] if job.audio_plan else []) if mode == "audio" else list(job.video_candidates)
     )
-
-    if plan.get("merge_output_format"):
-        ydl_opts["merge_output_format"] = str(plan["merge_output_format"])
-
-    if mode == "audio":
-        mp3_kbps = int(plan.get("mp3_kbps", 128))
-        ydl_opts["postprocessors"] = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": str(mp3_kbps),
-            }
-        ]
-
-    info: dict[str, Any] = {}
-    file_path: str | None = None
 
     try:
         _check_job(job_id, deadline)
@@ -531,46 +550,96 @@ def _download_and_send(job: DownloadJob) -> None:
             force=True,
         )
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-        except Exception:
-            _check_job(job_id, deadline)
-            LOGGER.debug("primary download attempt failed job_id=%s; evaluating fallback", job_id, exc_info=True)
-            # Conservative one-shot fallback for YouTube extractor churn.
-            if _is_youtube_url(url) and mode != "audio":
-                fallback_opts = dict(ydl_opts)
-                fallback_opts["format"] = "18/best[ext=mp4]/best"
-                fallback_opts["concurrent_fragment_downloads"] = 1
-                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-            elif _is_instagram_url(url):
-                fallback_opts = dict(ydl_opts)
-                fallback_opts.pop("impersonate", None)
-                fallback_opts["retries"] = 5
-                fallback_opts["fragment_retries"] = 5
-                fallback_opts["socket_timeout"] = 20
-                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-            else:
+        for index, plan in enumerate(plans, start=1):
+            cleanup_directory_contents(job_dir)
+            tmp_id = uuid.uuid4().hex
+            options = build_options(plan, tmp_id)
+            info: dict[str, Any]
+            try:
+                _check_job(job_id, deadline)
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    info = ydl.process_ie_result(
+                        _metadata_without_format_selection(job.metadata),
+                        download=True,
+                    )
+            except (JobCancelled, JobTimedOut):
                 raise
+            except Exception:
+                _check_job(job_id, deadline)
+                if not _is_instagram_url(url):
+                    LOGGER.warning(
+                        "download candidate failed job_id=%s stage=download candidate=%s attempt=%s/%s",
+                        job_id,
+                        plan.get("format_spec"),
+                        index,
+                        len(plans),
+                        exc_info=True,
+                    )
+                    cleanup_directory_contents(job_dir)
+                    continue
+                LOGGER.info(
+                    "Instagram fresh extraction retry job_id=%s stage=download candidate=%s",
+                    job_id,
+                    plan.get("format_spec"),
+                    exc_info=True,
+                )
+                cleanup_directory_contents(job_dir)
+                tmp_id = uuid.uuid4().hex
+                options = build_options(plan, tmp_id)
+                options.pop("impersonate", None)
+                options["concurrent_fragment_downloads"] = 1
+                try:
+                    with yt_dlp.YoutubeDL(options) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                except (JobCancelled, JobTimedOut):
+                    raise
+                except Exception:
+                    LOGGER.warning(
+                        "Instagram candidate failed after fresh extraction job_id=%s candidate=%s attempt=%s/%s",
+                        job_id,
+                        plan.get("format_spec"),
+                        index,
+                        len(plans),
+                        exc_info=True,
+                    )
+                    cleanup_directory_contents(job_dir)
+                    continue
+
+            try:
+                _check_job(job_id, deadline)
+                prefer_ext = ".mp3" if mode == "audio" else None
+                file_path = _find_downloaded_file(info, os.fspath(job_dir), tmp_id, prefer_ext=prefer_ext)
+                if not file_path:
+                    file_path = _find_file_by_prefix(os.fspath(job_dir), tmp_id, prefer_ext=prefer_ext)
+                if not file_path:
+                    raise RuntimeError("downloaded file was not found")
+                remaining = max(1.0, deadline - time.monotonic())
+                validate_media_file(
+                    file_path,
+                    mode,
+                    MAX_SEND_BYTES,
+                    timeout_seconds=min(15.0, remaining),
+                )
+                break
+            except (JobCancelled, JobTimedOut):
+                raise
+            except Exception:
+                LOGGER.warning(
+                    "download candidate rejected job_id=%s stage=validate candidate=%s attempt=%s/%s",
+                    job_id,
+                    plan.get("format_spec"),
+                    index,
+                    len(plans),
+                    exc_info=True,
+                )
+                file_path = None
+                cleanup_directory_contents(job_dir)
+        else:
+            raise RuntimeError("all prechecked download candidates failed")
 
         _check_job(job_id, deadline)
-
-        prefer_ext = ".mp3" if mode == "audio" else None
-        file_path = _find_downloaded_file(info, os.fspath(job_dir), tmp_id, prefer_ext=prefer_ext)
         if not file_path:
-            file_path = _find_file_by_prefix(os.fspath(job_dir), tmp_id, prefer_ext=prefer_ext)
-
-        if not file_path or not os.path.exists(file_path):
-            raise RuntimeError("Downloaded file not found")
-
-        # Final hard check before upload
-        final_size = os.path.getsize(file_path)
-        if final_size > MAX_SEND_BYTES:
-            raise RuntimeError(
-                f"This file is {_fmt_bytes(final_size)}, which exceeds the limit {_fmt_bytes(MAX_SEND_BYTES)}."
-            )
+            raise RuntimeError("downloaded file was not found")
 
         base = _sanitize_filename_base(title)
 
@@ -642,7 +711,6 @@ def _download_and_send(job: DownloadJob) -> None:
         )
     except Exception:
         LOGGER.exception("job failed job_id=%s stage=processing url=%s", job_id, safe_url_for_log(url))
-        _notify_operator_critical(f"Critical job failure\njob_id={job_id}\nstage=processing")
         if _is_cancelled(job_id):
             _safe_delete(chat_id, status_message_id)
         else:
@@ -736,7 +804,12 @@ def _send_choice_ui(message, url: str) -> None:
     processing_msg = bot.reply_to(message, "Getting info...", disable_web_page_preview=True)
 
     try:
-        meta = _get_video_meta_with_hidden_retries(url)
+        meta = _run_metadata_operation(url)
+    except (MetadataBusy, MetadataTimedOut):
+        LOGGER.warning("metadata unavailable url=%s", safe_url_for_log(url), exc_info=True)
+        _safe_delete(message.chat.id, processing_msg.message_id)
+        bot.reply_to(message, "Invalid URL or unsupported website.", disable_web_page_preview=True)
+        return
     except Exception:
         LOGGER.exception("metadata failed url=%s", safe_url_for_log(url))
         _safe_delete(message.chat.id, processing_msg.message_id)
@@ -746,9 +819,11 @@ def _send_choice_ui(message, url: str) -> None:
     title = (meta.get("title") or "Video").strip()
     title = _strip_hashtags(title) or "Video"
 
-    # Build plans (no squeezing)
-    video_plan = _build_video_plan_no_squeeze(meta)
-    video_plan = _apply_probe_if_needed(video_plan)
+    # Build a best-first list. Every retained candidate has a proven size.
+    proven_candidates = _build_video_candidates(meta, 2**63 - 1)
+    video_candidates = [candidate for candidate in proven_candidates if candidate.estimated_size <= MAX_SEND_BYTES]
+    video_plan = video_candidates[0] if video_candidates else None
+    display_plan = video_plan or (proven_candidates[0] if proven_candidates else None)
 
     audio_plan, audio_reason = _build_audio_plan_mp3(meta, MAX_SEND_BYTES)
 
@@ -756,8 +831,8 @@ def _send_choice_ui(message, url: str) -> None:
 
     # Decide availability for VIDEO/DOC:
     # We allow only if size is confident and <= limit.
-    video_size = video_plan.get("estimated_size")
-    video_conf = bool(video_plan.get("estimated_confident")) and isinstance(video_size, int) and video_size > 0
+    video_size = display_plan.get("estimated_size") if display_plan else None
+    video_conf = bool(display_plan and display_plan.estimated_confident and display_plan.estimated_size > 0)
     video_ok = bool(video_conf and isinstance(video_size, int) and video_size <= MAX_SEND_BYTES)
 
     # If video is confidently too big -> tell and do not offer Video/Document.
@@ -780,8 +855,9 @@ def _send_choice_ui(message, url: str) -> None:
                     reply_to_message_id=message.message_id,
                     url=url,
                     title=title,
-                    video_plan=None,
+                    video_candidates=(),
                     audio_plan=audio_plan,
+                    metadata=meta,
                 )
 
             kb = types.InlineKeyboardMarkup(row_width=1)
@@ -821,8 +897,9 @@ def _send_choice_ui(message, url: str) -> None:
                     reply_to_message_id=message.message_id,
                     url=url,
                     title=title,
-                    video_plan=None,
+                    video_candidates=(),
                     audio_plan=audio_plan,
+                    metadata=meta,
                 )
 
             kb = types.InlineKeyboardMarkup(row_width=1)
@@ -851,8 +928,9 @@ def _send_choice_ui(message, url: str) -> None:
             reply_to_message_id=message.message_id,
             url=url,
             title=title,
-            video_plan=video_plan,
+            video_candidates=tuple(video_candidates),
             audio_plan=audio_plan,
+            metadata=meta,
         )
 
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -983,20 +1061,17 @@ def on_download_choice(call):
         title = req.title
 
         if mode == "audio":
-            plan = req.audio_plan
-            if not plan:
+            if not req.audio_plan:
                 _safe_answer_callback(call.id, "Audio is not available.")
                 return
             job_mode = "audio"
         elif mode == "doc":
-            plan = req.video_plan
-            if not plan:
+            if not req.video_candidates:
                 _safe_answer_callback(call.id, "Video is not available.")
                 return
             job_mode = "doc"
         else:
-            plan = req.video_plan
-            if not plan:
+            if not req.video_candidates:
                 _safe_answer_callback(call.id, "Video is not available.")
                 return
             job_mode = "video"
@@ -1032,7 +1107,9 @@ def on_download_choice(call):
             url=url,
             title=title,
             mode=job_mode,
-            plan=plan,
+            video_candidates=req.video_candidates,
+            audio_plan=req.audio_plan,
+            metadata=req.metadata,
             deadline=time.monotonic() + _settings().job_timeout_seconds,
         )
         try:
@@ -1161,20 +1238,50 @@ def _preflight(settings: Settings, instance: telebot.TeleBot) -> None:
 
 
 def _maintenance_loop() -> None:
-    while not stop_event.wait(300):
-        try:
-            _cleanup_pending()
-            cleanup_stale_directories(_output_folder(), _settings().job_timeout_seconds * 2)
-            health_file = _output_folder().parent / ".healthy"
-            health_file.touch(exist_ok=True)
-        except Exception:
-            LOGGER.exception("periodic maintenance failed")
+    last_cleanup = 0.0
+    try:
+        while not stop_event.wait(25):
+            if not _heartbeat():
+                break
+            try:
+                now = time.monotonic()
+                if now - last_cleanup >= 300:
+                    _cleanup_pending()
+                    cleanup_stale_directories(_output_folder(), _settings().job_timeout_seconds * 2)
+                    last_cleanup = now
+            except Exception:
+                LOGGER.exception("periodic maintenance failed")
+    finally:
+        maintenance_finished.set()
+
+
+def _heartbeat() -> bool:
+    workers_alive = bool(worker_threads) and all(thread.is_alive() for thread in worker_threads)
+    if stop_event.is_set() or maintenance_finished.is_set() or not workers_alive:
+        HEALTH_MARKER.unlink(missing_ok=True)
+        if not stop_event.is_set() and not workers_alive:
+            LOGGER.critical("required download worker terminated; application is unhealthy")
+            fatal_lifecycle_error.set()
+            if not worker_failure_alerted.is_set():
+                worker_failure_alerted.set()
+                _notify_operator_critical("Critical lifecycle failure\nA download worker terminated")
+            stop_event.set()
+            if bot is not None:
+                try:
+                    bot.stop_polling()
+                except Exception:
+                    LOGGER.exception("failed to stop polling after worker failure")
+        return False
+    HEALTH_MARKER.touch()
+    return True
 
 
 def startup(settings: Settings) -> telebot.TeleBot:
     global SETTINGS, bot, WORKERS, PENDING_TTL_SEC, MAX_SEND_BYTES
     global YTDLP_CONCURRENT_FRAGMENTS, jobs_q, upload_slots, maintenance_thread
+    global metadata_slots, metadata_executor
 
+    HEALTH_MARKER.unlink(missing_ok=True)
     SETTINGS = settings
     WORKERS = settings.workers
     PENDING_TTL_SEC = settings.pending_ttl_seconds
@@ -1182,13 +1289,20 @@ def startup(settings: Settings) -> telebot.TeleBot:
     YTDLP_CONCURRENT_FRAGMENTS = settings.concurrent_fragments
     jobs_q = queue.Queue(maxsize=settings.max_queue)
     upload_slots = threading.BoundedSemaphore(settings.upload_workers)
+    metadata_slots = threading.BoundedSemaphore(settings.metadata_workers)
     stop_event.clear()
+    maintenance_finished.clear()
+    fatal_lifecycle_error.clear()
+    worker_failure_alerted.clear()
 
     bot = telebot.TeleBot(settings.token, threaded=True)
     register_handlers(bot)
     _preflight(settings, bot)
     cleanup_stale_directories(settings.output_dir, settings.job_timeout_seconds * 2)
-    (settings.output_dir.parent / ".healthy").touch(exist_ok=True)
+    metadata_executor = ThreadPoolExecutor(
+        max_workers=settings.metadata_workers,
+        thread_name_prefix="metadata",
+    )
 
     worker_threads.clear()
     for index in range(settings.workers):
@@ -1197,11 +1311,16 @@ def startup(settings: Settings) -> telebot.TeleBot:
         worker_threads.append(thread)
     maintenance_thread = threading.Thread(target=_maintenance_loop, name="maintenance", daemon=False)
     maintenance_thread.start()
+    if not maintenance_thread.is_alive() or not _heartbeat():
+        stop()
+        raise RuntimeError("application lifecycle threads failed to start")
     LOGGER.info("application started workers=%s max_queue=%s", settings.workers, settings.max_queue)
     return bot
 
 
 def stop() -> None:
+    global metadata_executor
+    HEALTH_MARKER.unlink(missing_ok=True)
     stop_event.set()
     with state_lock:
         events = list(cancel_events.values())
@@ -1223,6 +1342,10 @@ def stop() -> None:
             LOGGER.error("worker did not stop gracefully name=%s", thread.name)
     if maintenance_thread is not None:
         maintenance_thread.join(timeout=5)
+    if metadata_executor is not None:
+        metadata_executor.shutdown(wait=False, cancel_futures=True)
+        metadata_executor = None
+    HEALTH_MARKER.unlink(missing_ok=True)
     LOGGER.info("application stopped")
 
 
@@ -1247,6 +1370,8 @@ def main() -> None:
         signal.signal(signal.SIGTERM, _signal_handler)
         signal.signal(signal.SIGINT, _signal_handler)
         run()
+        if fatal_lifecycle_error.is_set():
+            raise RuntimeError("required application worker terminated")
     except Exception:
         LOGGER.exception("application terminated unexpectedly")
         raise

@@ -11,6 +11,7 @@ def test_all_production_files_are_tracked_sources() -> None:
         "docker-compose.yml",
         ".env-example",
         "scripts/docker-entrypoint.sh",
+        "scripts/lib-production.sh",
         "scripts/deploy.sh",
         "scripts/update-ytdlp.sh",
         "scripts/systemd/videodownloaderbot-deploy.service",
@@ -31,6 +32,9 @@ def test_docker_hardening_and_no_runtime_pip() -> None:
     assert "read_only: true" in compose
     assert "no-new-privileges:true" in compose
     assert "pip install" not in updater
+    assert "--pull" not in updater
+    assert '"$health" == "healthy"' in (ROOT / "scripts/lib-production.sh").read_text(encoding="utf-8")
+    assert "/tmp/videodownloaderbot.healthy" in (ROOT / "app/healthcheck.py").read_text(encoding="utf-8")
 
 
 def test_main_is_import_safe() -> None:
@@ -58,3 +62,6 @@ def test_installer_preserves_existing_environment_and_uses_main() -> None:
     assert "pull --ff-only" in installer
     assert "status --porcelain --untracked-files=no" in installer
     assert "write_docker_files" not in installer
+    assert "systemctl enable --now docker" in installer
+    assert "docker info" in installer
+    assert '"$health" == "healthy"' in installer

@@ -8,6 +8,19 @@ from pathlib import Path
 LOGGER = logging.getLogger(__name__)
 
 
+def cleanup_directory_contents(path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        for child in path.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink(missing_ok=True)
+    except OSError:
+        LOGGER.exception("attempt cleanup failed path=%s", path)
+
+
 def cleanup_job_directory(path: Path) -> None:
     try:
         if path.exists():

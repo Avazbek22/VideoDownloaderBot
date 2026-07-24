@@ -6,6 +6,23 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class VideoFormatCandidate:
+    format_spec: str
+    merge_output_format: str | None
+    estimated_size: int
+    estimated_confident: bool
+    quality_label: str
+    compatibility: int
+    direct_urls: tuple[str, ...]
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
+@dataclass(frozen=True)
 class PendingRequest:
     created_at: float
     user_id: int
@@ -13,8 +30,9 @@ class PendingRequest:
     reply_to_message_id: int
     url: str
     title: str
-    video_plan: dict[str, Any] | None
+    video_candidates: tuple[VideoFormatCandidate, ...]
     audio_plan: dict[str, Any] | None
+    metadata: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -27,7 +45,9 @@ class DownloadJob:
     url: str
     title: str
     mode: str
-    plan: dict[str, Any]
+    video_candidates: tuple[VideoFormatCandidate, ...]
+    audio_plan: dict[str, Any] | None
+    metadata: dict[str, Any]
     deadline: float
 
 

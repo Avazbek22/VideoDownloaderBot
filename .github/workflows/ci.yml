@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, Improvements]
   pull_request:
 
 concurrency:
@@ -37,6 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: shellcheck install.sh scripts/*.sh scripts/docker-entrypoint.sh tests/shell/*.sh
       - run: bash tests/shell/test-deploy.sh
+      - run: cp .env-example .env && docker compose config --quiet
 
   docker:
     runs-on: ubuntu-latest

@@ -61,10 +61,11 @@ Most “download bots” are either public (unstable / rate-limited / banned), o
 
 2. Bot calls yt-dlp **metadata-only** (no download yet).
 
-3. Bot builds a **video plan**:
+3. Bot builds a best-first list of **video candidates**:
 
-* tries best **progressive MP4** (video+audio in one file)
-* otherwise uses best **MP4 video + M4A audio** (merged)
+* ranks Telegram-compatible H.264 MP4 by compatibility and quality
+* supports both progressive MP4 and MP4 video + M4A audio without automatically preferring progressive
+* handles deduplicated Instagram direct MP4 candidates whose codec metadata is missing
 
 4. Bot tries to **prove** final size is ≤ 50 MB:
 
@@ -138,9 +139,9 @@ Runtime logs are also written to `logs/bot.log`. Downloads use per-job directori
 
 `videodownloaderbot-deploy.timer` checks `origin/main` every two minutes. Runtime changes are built and tested in a new image; documentation-only commits update the checkout without rebuilding the container. Before replacement, deployment verifies Python imports, ffmpeg, Node, yt-dlp, and Telegram `getMe`.
 
-If build, preflight, container startup, or health stabilization fails, the previous Git commit and Docker image are restored. The failed SHA is stored in `data/.failed-deploy-sha` and is not retried until a newer commit arrives. Daily deployment logs are stored in `logs/deploy-YYYY-MM-DD.log` for 60 days.
+If build, preflight, container startup, or health stabilization fails, the previous Git commit and Docker image are restored. Changed systemd unit files are refreshed transactionally and restored too if deployment fails. The failed SHA is stored in `data/.failed-deploy-sha` and is not retried until a newer commit arrives. Daily deployment logs are stored in `logs/deploy-YYYY-MM-DD.log` for 60 days.
 
-`videodownloaderbot-yt-dlp-update.timer` performs a nightly image rebuild using `YTDLP_CACHEBUST`. It never runs `pip install` inside the running container and rolls back to the previous image if validation or startup fails. Updater logs are stored in `logs/updater-YYYY-MM-DD.log`.
+`videodownloaderbot-yt-dlp-update.timer` performs a nightly image rebuild using `YTDLP_CACHEBUST`. It never runs `pip install` inside the running container, does not pull a new base image, and does not restart the bot when yt-dlp is already current. A changed update rolls back to the previous image if validation or startup fails. Updater logs are stored in `logs/updater-YYYY-MM-DD.log`.
 
 ---
 
@@ -208,6 +209,12 @@ Operational settings are read through the validated `Settings` dataclass:
 * `JOB_TIMEOUT_SECONDS` — whole-job deadline; default `900`
 * `PENDING_TTL_SECONDS` — button request lifetime; default `600`
 * `YTDLP_CONCURRENT_FRAGMENTS` — segmented download concurrency; default `4`
+* `YTDLP_JS_RUNTIMES` — yt-dlp JavaScript runtimes; default `node`
+* `YTDLP_REMOTE_COMPONENTS` — optional yt-dlp remote components; empty disables them
+* `YTDLP_INSTAGRAM_IMPERSONATE` — optional Instagram impersonation target
+* `YTDLP_INSTAGRAM_RETRIES`, `YTDLP_INSTAGRAM_FRAGMENT_RETRIES`, `YTDLP_INSTAGRAM_SOCKET_TIMEOUT` — bounded Instagram retry/timeouts
+* `METADATA_WORKERS` — maximum concurrent metadata operations; default `2`
+* `METADATA_TIMEOUT_SECONDS` — metadata-stage timeout; default `60`
 * `COOKIES_FILE` — optional cookies file, normally `/app/data/cookies.txt`
 * `LOG_LEVEL` — `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`
 
@@ -240,6 +247,23 @@ EOF
 # run
 python -u main.py
 ```
+
+### Manual Docker start
+
+The image runs as UID/GID `10001`, so prepare the two writable bind mounts before starting it:
+
+```bash
+cp .env-example .env
+# Set BOT_TOKEN in .env, then:
+mkdir -p data logs
+sudo chown -R 10001:10001 data logs
+chmod 600 .env
+docker compose build
+docker compose up -d
+docker compose ps
+```
+
+The container root filesystem is read-only. Only `data/`, `logs/`, and the in-memory `/tmp` filesystem are writable; Docker health is based on a fresh `/tmp/videodownloaderbot.healthy` heartbeat.
 
 ---
 
