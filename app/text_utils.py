@@ -1,5 +1,4 @@
 import re
-from typing import Optional
 
 
 def youtube_url_validation(url: str):
@@ -11,7 +10,7 @@ def youtube_url_validation(url: str):
     return re.match(youtube_regex, url)
 
 
-def extract_first_url(text: str) -> Optional[str]:
+def extract_first_url(text: str) -> str | None:
     if not text:
         return None
     m = re.search(r"(https?://\S+)", text.strip())
@@ -48,7 +47,7 @@ def sanitize_filename_base(title: str, max_len: int = 120) -> str:
     return title
 
 
-def fmt_bytes(n: Optional[int]) -> str:
+def fmt_bytes(n: int | None) -> str:
     if not isinstance(n, int) or n < 0:
         return "unknown"
     units = ["B", "KB", "MB", "GB"]
@@ -60,4 +59,3 @@ def fmt_bytes(n: Optional[int]) -> str:
     if i == 0:
         return f"{int(v)} {units[i]}"
     return f"{v:.1f} {units[i]}"
-

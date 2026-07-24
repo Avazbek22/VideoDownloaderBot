@@ -136,6 +136,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env-example
 .envrc
 .venv
 env/
@@ -187,6 +189,17 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file. However, if you prefer, 
 #  you could uncomment the following to ignore the entire vscode folder
 # .vscode/
+
+# Local IDE and generated compatibility configuration
+.idea/
+config.py
+
+# Runtime state
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+cookies*.txt
 
 # Ruff stuff:
 .ruff_cache/

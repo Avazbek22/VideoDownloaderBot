@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib-production.sh
+source "$SCRIPT_DIR/lib-production.sh"
+SERVICE_KEY="${SERVICE_KEY:-videodownloaderbot}"
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-videodownloaderbot}"
+IMAGE_NAME="${IMAGE_NAME:-videodownloaderbot:local}"
+ROLLBACK_IMAGE="${IMAGE_NAME%:*}:rollback"
+LOCK_FILE="${LOCK_FILE:-/run/lock/videodownloaderbot-update.lock}"
+update_started=0
+replacement_attempted=0
+
+log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+
+rollback() {
+  local code=$?
+  [[ "$code" -ne 0 ]] || code=1
+  trap - ERR INT TERM
+  if [[ "$update_started" == "1" ]] && docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
+    log "yt-dlp update failed; restoring previous image"
+    docker image tag "$ROLLBACK_IMAGE" "$IMAGE_NAME" || log "failed to restore rollback tag"
+    if [[ "$replacement_attempted" == "1" ]]; then
+      compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" \
+        up -d --no-deps --force-recreate "$SERVICE_KEY" || log "failed to recreate rollback container"
+    fi
+  fi
+  exit "$code"
+}
+
+main() {
+  mkdir -p "$ROOT_DIR/logs" "$ROOT_DIR/data" "$(dirname "$LOCK_FILE")"
+  find "$ROOT_DIR/logs" -maxdepth 1 -type f -name 'updater-*.log' -mtime +60 -delete
+  exec >>"$ROOT_DIR/logs/updater-$(date -u '+%Y-%m-%d').log" 2>&1
+  command -v flock >/dev/null 2>&1 || { log "flock is required"; return 1; }
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then log "another deployment/update is running; skipping"; return 0; fi
+  [[ -f "$ROOT_DIR/.env" ]] || { log "missing .env"; return 1; }
+
+  cd "$ROOT_DIR"
+  docker image inspect "$IMAGE_NAME" >/dev/null 2>&1 || { log "current image is unavailable"; return 1; }
+  local before after
+  before="$(compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" python -m yt_dlp --version)"
+  docker image tag "$IMAGE_NAME" "$ROLLBACK_IMAGE"
+  update_started=1
+  trap rollback ERR INT TERM
+
+  compose -p "$COMPOSE_PROJECT" build \
+    --build-arg "YTDLP_CACHEBUST=$(date -u '+%Y%m%dT%H%M%SZ')" "$SERVICE_KEY"
+  after="$(compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" python -m yt_dlp --version)"
+  if [[ "$before" == "$after" ]]; then
+    docker image tag "$ROLLBACK_IMAGE" "$IMAGE_NAME"
+    update_started=0
+    trap - ERR INT TERM
+    log "yt-dlp already up to date: $before"
+    return 0
+  fi
+  smoke_test_image
+  replacement_attempted=1
+  compose -p "$COMPOSE_PROJECT" up -d --no-deps --force-recreate "$SERVICE_KEY"
+  wait_until_stable
+
+  update_started=0
+  trap - ERR INT TERM
+  log "yt-dlp update successful: $before -> $after"
+}
+
+main "$@"

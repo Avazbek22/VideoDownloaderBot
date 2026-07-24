@@ -1,10 +1,13 @@
+import logging
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from app.text_utils import fmt_bytes
 
+LOGGER = logging.getLogger(__name__)
 
-def calc_download_progress(d: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+
+def calc_download_progress(d: dict[str, Any], state: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
     """
     Returns (percent, downloaded_bytes, total_bytes).
     - Prefer fragment-based progress for HLS/DASH.
@@ -63,10 +66,10 @@ def calc_download_progress(d: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Op
 def render_status(
     title: str,
     stage: str,
-    pct: Optional[int],
-    downloaded: Optional[int],
-    total: Optional[int],
-    queued_pos: Optional[int] = None,
+    pct: int | None,
+    downloaded: int | None,
+    total: int | None,
+    queued_pos: int | None = None,
 ) -> str:
     if stage == "queued":
         line = "Status: ⏳ Queued"
@@ -109,7 +112,7 @@ def render_status(
     return f"{title}\n\nStatus: ✅ Done!"
 
 
-def find_file_by_prefix(output_folder: str, prefix: str, prefer_ext: Optional[str] = None) -> Optional[str]:
+def find_file_by_prefix(output_folder: str, prefix: str, prefer_ext: str | None = None) -> str | None:
     try:
         files = [fn for fn in os.listdir(output_folder) if fn.startswith(prefix)]
         if not files:
@@ -132,29 +135,28 @@ def find_file_by_prefix(output_folder: str, prefix: str, prefer_ext: Optional[st
                     best_mtime = mtime
                     best = fp
             except Exception:
-                pass
+                LOGGER.debug("could not stat download candidate path=%s", fp, exc_info=True)
 
         if best and os.path.exists(best):
             return best
 
     except Exception:
-        pass
+        LOGGER.exception("downloaded file discovery failed folder=%s prefix=%s", output_folder, prefix)
     return None
 
 
 def find_downloaded_file(
-    info: Dict[str, Any],
+    info: dict[str, Any],
     output_folder: str,
     fallback_prefix: str,
-    prefer_ext: Optional[str] = None,
-) -> Optional[str]:
+    prefer_ext: str | None = None,
+) -> str | None:
     try:
         req = (info.get("requested_downloads") or [])[0]
         fp = req.get("filepath")
         if fp and os.path.exists(fp):
             return fp
     except Exception:
-        pass
+        LOGGER.debug("requested_downloads did not contain a usable filepath", exc_info=True)
 
     return find_file_by_prefix(output_folder, fallback_prefix, prefer_ext=prefer_ext)
-

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run VideoDownloaderBot yt-dlp image update nightly
+
+[Timer]
+OnCalendar=*-*-* 03:27:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=videodownloaderbot-yt-dlp-update.service
+
+[Install]
+WantedBy=timers.target

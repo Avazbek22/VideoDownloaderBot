@@ -1,0 +1,16 @@
+[Unit]
+Description=Nightly yt-dlp image update for VideoDownloaderBot
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__INSTALL_DIR__
+Environment=ROOT_DIR=__INSTALL_DIR__
+Environment=COMPOSE_PROJECT=__COMPOSE_PROJECT__
+Environment=SERVICE_KEY=__SERVICE_KEY__
+ExecStart=/usr/bin/env bash __INSTALL_DIR__/scripts/update-ytdlp.sh
+
+[Install]
+WantedBy=multi-user.target

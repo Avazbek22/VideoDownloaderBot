@@ -1,23 +1,53 @@
+import logging
 import re
+from copy import deepcopy
+from typing import Any
 from urllib.parse import urlparse
-from typing import Any, Dict, Optional, Tuple
 
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
 from app.http_utils import requests_session_with_retries
+from app.models import VideoFormatCandidate
 from app.text_utils import fmt_bytes
+from app.url_security import MAX_REDIRECTS, domain_matches, validate_public_url, validate_redirect
 
 AUDIO_HEADROOM_BYTES = 1_500_000
+LOGGER = logging.getLogger(__name__)
+H264_PREFIXES = ("avc1", "avc3", "h264")
+FORMAT_SELECTION_FIELDS = frozenset(
+    {
+        "requested_formats",
+        "requested_downloads",
+        "format_id",
+        "format",
+        "url",
+        "manifest_url",
+        "ext",
+        "vcodec",
+        "acodec",
+        "width",
+        "height",
+        "resolution",
+        "filesize",
+        "filesize_approx",
+        "tbr",
+        "vbr",
+        "abr",
+        "protocol",
+        "container",
+    }
+)
 
 
 def is_youtube_url(url: str) -> bool:
     try:
         host = (urlparse(url).netloc or "").lower()
     except Exception:
+        LOGGER.debug("failed to parse URL while checking YouTube domain", exc_info=True)
         return False
     return any(
-        x in host
+        domain_matches(host, x)
         for x in (
             "youtube.com",
             "youtu.be",
@@ -30,9 +60,10 @@ def is_instagram_url(url: str) -> bool:
     try:
         host = (urlparse(url).netloc or "").lower()
     except Exception:
+        LOGGER.debug("failed to parse URL while checking Instagram domain", exc_info=True)
         return False
     return any(
-        x in host
+        domain_matches(host, x)
         for x in (
             "instagram.com",
             "instagr.am",
@@ -41,15 +72,15 @@ def is_instagram_url(url: str) -> bool:
 
 
 def apply_youtube_runtime_opts(
-    opts: Dict[str, Any],
+    opts: dict[str, Any],
     url: str,
-    js_runtimes: Optional[str],
-    remote_components: Optional[str],
-) -> Dict[str, Any]:
+    js_runtimes: str | None,
+    remote_components: str | None,
+) -> dict[str, Any]:
     if not is_youtube_url(url):
         return opts
     if js_runtimes:
-        parsed: Dict[str, Dict[str, str]] = {}
+        parsed: dict[str, dict[str, str]] = {}
         for raw in str(js_runtimes).split(","):
             item = raw.strip()
             if not item:
@@ -58,7 +89,7 @@ def apply_youtube_runtime_opts(
             runtime = runtime.strip().lower()
             if not runtime:
                 continue
-            conf: Dict[str, str] = {}
+            conf: dict[str, str] = {}
             if path.strip():
                 conf["path"] = path.strip()
             parsed[runtime] = conf
@@ -72,13 +103,13 @@ def apply_youtube_runtime_opts(
 
 
 def apply_instagram_stability_opts(
-    opts: Dict[str, Any],
+    opts: dict[str, Any],
     url: str,
-    impersonate: Optional[str],
-    retries: Optional[int],
-    fragment_retries: Optional[int],
-    socket_timeout: Optional[int],
-) -> Dict[str, Any]:
+    impersonate: str | None,
+    retries: int | None,
+    fragment_retries: int | None,
+    socket_timeout: int | None,
+) -> dict[str, Any]:
     if not is_instagram_url(url):
         return opts
     if impersonate:
@@ -88,7 +119,7 @@ def apply_instagram_stability_opts(
                 opts["impersonate"] = ImpersonateTarget.from_str(imp)
             except Exception:
                 # If parsing fails, keep working without forced impersonation.
-                pass
+                LOGGER.debug("invalid yt-dlp impersonation target=%s", imp, exc_info=True)
     if isinstance(retries, int) and retries > 0:
         opts["retries"] = retries
     if isinstance(fragment_retries, int) and fragment_retries > 0:
@@ -98,7 +129,7 @@ def apply_instagram_stability_opts(
     return opts
 
 
-def probe_url_size_bytes(url: str, timeout_sec: int = 10) -> Optional[int]:
+def probe_url_size_bytes(url: str, timeout_sec: int = 10) -> int | None:
     """
     Try to get real content size without downloading the file:
     - Send GET with Range: bytes=0-0
@@ -109,13 +140,26 @@ def probe_url_size_bytes(url: str, timeout_sec: int = 10) -> Optional[int]:
 
     s = requests_session_with_retries()
     try:
-        resp = s.get(
-            url,
-            headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"},
-            stream=True,
-            timeout=(timeout_sec, timeout_sec),
-            allow_redirects=True,
-        )
+        current_url = validate_public_url(url)
+        resp = None
+        for _ in range(MAX_REDIRECTS + 1):
+            resp = s.get(
+                current_url,
+                headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"},
+                stream=True,
+                timeout=(timeout_sec, timeout_sec),
+                allow_redirects=False,
+            )
+            if resp.is_redirect or resp.is_permanent_redirect:
+                next_url = validate_redirect(current_url, resp.headers.get("Location", ""))
+                resp.close()
+                current_url = next_url
+                continue
+            break
+        else:
+            return None
+        if resp is None or resp.is_redirect or resp.is_permanent_redirect:
+            return None
         cr = resp.headers.get("Content-Range") or resp.headers.get("content-range")
         if cr:
             m = re.search(r"/(\d+)\s*$", cr.strip())
@@ -134,24 +178,25 @@ def probe_url_size_bytes(url: str, timeout_sec: int = 10) -> Optional[int]:
 
         return None
     except Exception:
+        LOGGER.debug("size probe failed url=%s", url, exc_info=True)
         return None
     finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        s.close()
 
 
 def get_video_meta(
     url: str,
-    js_runtimes: Optional[str] = None,
-    remote_components: Optional[str] = None,
-    instagram_impersonate: Optional[str] = None,
-    instagram_retries: Optional[int] = None,
-    instagram_fragment_retries: Optional[int] = None,
-    instagram_socket_timeout: Optional[int] = None,
-) -> Dict[str, Any]:
-    ydl_opts: Dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    js_runtimes: str | None = None,
+    remote_components: str | None = None,
+    instagram_impersonate: str | None = None,
+    instagram_retries: int | None = None,
+    instagram_fragment_retries: int | None = None,
+    instagram_socket_timeout: int | None = None,
+    cookies_file: str | None = None,
+) -> dict[str, Any]:
+    ydl_opts: dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
     ydl_opts = apply_youtube_runtime_opts(ydl_opts, url, js_runtimes, remote_components)
     ydl_opts = apply_instagram_stability_opts(
         ydl_opts,
@@ -165,14 +210,14 @@ def get_video_meta(
         return ydl.extract_info(url, download=False)
 
 
-def _duration_sec(meta: Dict[str, Any]) -> Optional[int]:
+def _duration_sec(meta: dict[str, Any]) -> int | None:
     dur = meta.get("duration")
     if isinstance(dur, (int, float)) and dur > 0:
         return int(dur)
     return None
 
 
-def _format_size_bytes(fmt: Dict[str, Any], dur: Optional[int]) -> Tuple[Optional[int], bool]:
+def _format_size_bytes(fmt: dict[str, Any], dur: int | None) -> tuple[int | None, bool]:
     """
     Returns (size_bytes, confident).
     confident=True when size comes from 'filesize' or 'filesize_approx' or URL probe.
@@ -195,160 +240,157 @@ def _format_size_bytes(fmt: Dict[str, Any], dur: Optional[int]) -> Tuple[Optiona
     return None, False
 
 
-def _best_progressive_mp4(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Pick the best progressive MP4 (video+audio in one file), no limit filtering.
-    """
-    dur = _duration_sec(meta)
-    best = None
-    best_key = None
-
-    for f in meta.get("formats", []) or []:
-        if f.get("ext") != "mp4":
-            continue
-        if f.get("vcodec") == "none" or f.get("acodec") == "none":
-            continue
-
-        height = f.get("height") or 0
-        fps = f.get("fps") or 0
-        tbr = f.get("tbr") or 0
-
-        key = (int(height), int(fps), float(tbr))
-        if best is None or key > best_key:
-            size, conf = _format_size_bytes(f, dur)
-            best = {
-                "kind": "progressive",
-                "format_spec": str(f.get("format_id")),
-                "merge_output_format": None,
-                "estimated_size": size,
-                "estimated_confident": bool(conf),
-                "probe_urls": [f.get("url")] if f.get("url") else [],
-                "quality_label": f"{height}p" if height else "mp4",
-            }
-            best_key = key
-
-    return best
+def is_h264_codec(codec: Any) -> bool:
+    return isinstance(codec, str) and codec.strip().lower().startswith(H264_PREFIXES)
 
 
-def _best_separate_mp4_m4a(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Pick best mp4 video-only + best m4a audio-only, no limit filtering.
-    """
-    dur = _duration_sec(meta)
+def metadata_without_format_selection(meta: dict[str, Any]) -> dict[str, Any]:
+    cleaned = deepcopy(meta)
+    for key in FORMAT_SELECTION_FIELDS:
+        cleaned.pop(key, None)
+    return cleaned
 
-    best_v = None
-    best_v_key = None
-    best_a = None
-    best_a_key = None
 
-    for f in meta.get("formats", []) or []:
-        vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        ext = f.get("ext")
+def _positive_number(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) and value > 0 else 0.0
 
-        # video-only mp4
-        if ext == "mp4" and vcodec != "none" and acodec == "none":
-            height = f.get("height") or 0
-            fps = f.get("fps") or 0
-            tbr = f.get("tbr") or 0
-            key = (int(height), int(fps), float(tbr))
-            if best_v is None or key > best_v_key:
-                size, conf = _format_size_bytes(f, dur)
-                best_v = {"f": f, "size": size, "conf": conf}
-                best_v_key = key
 
-        # audio-only m4a (or mp4 audio-only)
-        if vcodec == "none" and acodec != "none" and ext in ("m4a", "mp4"):
-            abr = f.get("abr") or f.get("tbr") or 0
-            key = float(abr)
-            if best_a is None or key > best_a_key:
-                size, conf = _format_size_bytes(f, dur)
-                best_a = {"f": f, "size": size, "conf": conf}
-                best_a_key = key
-
-    if not best_v or not best_a:
+def _proven_component_size(fmt: dict[str, Any]) -> int | None:
+    for field in ("filesize", "filesize_approx"):
+        value = fmt.get(field)
+        if isinstance(value, int) and value > 0:
+            return value
+    url = fmt.get("url")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return None
-
-    total_size = None
-    confident = False
-    if isinstance(best_v["size"], int) and isinstance(best_a["size"], int):
-        total_size = int(best_v["size"]) + int(best_a["size"])
-        confident = bool(best_v["conf"] and best_a["conf"])
-
-    vf = best_v["f"]
-    af = best_a["f"]
-    height = vf.get("height") or 0
-
-    urls = []
-    if vf.get("url"):
-        urls.append(vf.get("url"))
-    if af.get("url"):
-        urls.append(af.get("url"))
-
-    return {
-        "kind": "separate",
-        "format_spec": f"{vf.get('format_id')}+{af.get('format_id')}",
-        "merge_output_format": "mp4",
-        "estimated_size": total_size,
-        "estimated_confident": confident,
-        "probe_urls": urls,
-        "quality_label": f"{height}p" if height else "mp4",
-    }
+    size = probe_url_size_bytes(url)
+    return size if isinstance(size, int) and size > 0 else None
 
 
-def build_video_plan_no_squeeze(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Build a video plan without reducing quality.
-    We will NOT download unless we can confidently prove size <= limit.
-    """
-    p = _best_progressive_mp4(meta)
-    if p:
-        return p
-
-    p = _best_separate_mp4_m4a(meta)
-    if p:
-        return p
-
-    # Fallback: let yt-dlp pick "best"; size will likely be unknown -> we will refuse by policy.
-    return {
-        "kind": "unknown",
-        "format_spec": "best",
-        "merge_output_format": None,
-        "estimated_size": None,
-        "estimated_confident": False,
-        "probe_urls": [],
-        "quality_label": "best",
-    }
+def _direct_urls(*formats: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        value
+        for value in (item.get("url") for item in formats)
+        if isinstance(value, str) and value.startswith(("http://", "https://"))
+    )
 
 
-def apply_probe_if_needed(plan: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    If plan does not have confident size, try probing direct URLs (Range request).
-    If we can probe all URLs -> confident total.
-    """
-    if plan.get("estimated_confident") and isinstance(plan.get("estimated_size"), int):
-        return plan
+def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[VideoFormatCandidate]:
+    """Return only preflight-size-proven, Telegram-compatible candidates, best first."""
+    formats = [item for item in meta.get("formats", []) or [] if isinstance(item, dict)]
+    instagram = is_instagram_url(str(meta.get("webpage_url") or meta.get("original_url") or ""))
+    raw: list[tuple[tuple[float, ...], VideoFormatCandidate]] = []
 
-    urls = plan.get("probe_urls") or []
-    urls = [u for u in urls if isinstance(u, str) and u.startswith("http")]
+    for fmt in formats:
+        if str(fmt.get("ext") or "").lower() != "mp4":
+            continue
+        vcodec = fmt.get("vcodec")
+        acodec = fmt.get("acodec")
+        has_known_h264 = is_h264_codec(vcodec)
+        is_unknown_instagram_direct = (
+            instagram
+            and not vcodec
+            and not acodec
+            and isinstance(fmt.get("url"), str)
+            and fmt["url"].startswith(("http://", "https://"))
+        )
+        if not (has_known_h264 or is_unknown_instagram_direct):
+            continue
+        if has_known_h264 and acodec in (None, "", "none"):
+            continue
+        size = _proven_component_size(fmt)
+        if size is None or size > limit_bytes:
+            continue
+        format_id = fmt.get("format_id")
+        if format_id is None:
+            continue
+        compatibility = 2 if has_known_h264 else 1
+        height = int(_positive_number(fmt.get("height")))
+        fps = _positive_number(fmt.get("fps"))
+        bitrate = _positive_number(fmt.get("tbr"))
+        candidate = VideoFormatCandidate(
+            format_spec=str(format_id),
+            merge_output_format=None,
+            estimated_size=size,
+            estimated_confident=True,
+            quality_label=f"{height}p" if height else "mp4",
+            compatibility=compatibility,
+            direct_urls=_direct_urls(fmt),
+        )
+        raw.append(((compatibility, height, fps, bitrate), candidate))
 
-    if not urls:
-        return plan
+    audio_formats = [
+        fmt
+        for fmt in formats
+        if str(fmt.get("ext") or "").lower() in {"m4a", "mp4"}
+        and fmt.get("vcodec") == "none"
+        and fmt.get("acodec") not in (None, "", "none")
+        and fmt.get("format_id") is not None
+    ]
+    audio_formats.sort(
+        key=lambda fmt: (_positive_number(fmt.get("abr")), _positive_number(fmt.get("tbr"))),
+        reverse=True,
+    )
+    proven_audio: tuple[dict[str, Any], int] | None = None
+    for audio in audio_formats:
+        audio_size = _proven_component_size(audio)
+        if audio_size is not None:
+            proven_audio = (audio, audio_size)
+            break
 
-    sizes = []
-    for u in urls:
-        sz = probe_url_size_bytes(u)
-        if not isinstance(sz, int) or sz <= 0:
-            return plan
-        sizes.append(sz)
+    if proven_audio:
+        audio, audio_size = proven_audio
+        for video in formats:
+            if (
+                str(video.get("ext") or "").lower() != "mp4"
+                or not is_h264_codec(video.get("vcodec"))
+                or video.get("acodec") != "none"
+                or video.get("format_id") is None
+            ):
+                continue
+            video_size = _proven_component_size(video)
+            if video_size is None or video_size + audio_size > limit_bytes:
+                continue
+            height = int(_positive_number(video.get("height")))
+            fps = _positive_number(video.get("fps"))
+            bitrate = _positive_number(video.get("tbr"))
+            candidate = VideoFormatCandidate(
+                format_spec=f"{video['format_id']}+{audio['format_id']}",
+                merge_output_format="mp4",
+                estimated_size=video_size + audio_size,
+                estimated_confident=True,
+                quality_label=f"{height}p" if height else "mp4",
+                compatibility=2,
+                direct_urls=_direct_urls(video, audio),
+            )
+            raw.append(((2, height, fps, bitrate), candidate))
 
-    total = int(sum(sizes))
-    plan["estimated_size"] = total
-    plan["estimated_confident"] = True
+    raw.sort(key=lambda item: item[0], reverse=True)
+    result: list[VideoFormatCandidate] = []
+    seen_specs: set[str] = set()
+    seen_urls: set[tuple[str, ...]] = set()
+    for _score, candidate in raw:
+        url_key = tuple(sorted(candidate.direct_urls))
+        if candidate.format_spec in seen_specs or (url_key and url_key in seen_urls):
+            continue
+        seen_specs.add(candidate.format_spec)
+        if url_key:
+            seen_urls.add(url_key)
+        result.append(candidate)
+    return result
+
+
+def build_video_plan_no_squeeze(meta: dict[str, Any]) -> VideoFormatCandidate | None:
+    candidates = build_video_candidates(meta, 2**63 - 1)
+    return candidates[0] if candidates else None
+
+
+def apply_probe_if_needed(plan: VideoFormatCandidate | None) -> VideoFormatCandidate | None:
+    # Kept as a compatibility shim for callers from older releases.
     return plan
 
 
-def build_audio_plan_mp3(meta: Dict[str, Any], limit_bytes: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def build_audio_plan_mp3(meta: dict[str, Any], limit_bytes: int) -> tuple[dict[str, Any] | None, str | None]:
     """
     Audio is allowed only if we can confidently keep MP3 under the limit.
     We compute it from duration and pick a bitrate that fits with headroom.
