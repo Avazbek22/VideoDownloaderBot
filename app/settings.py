@@ -54,6 +54,7 @@ class Settings:
     ytdlp_instagram_retries: int = 8
     ytdlp_instagram_fragment_retries: int = 8
     ytdlp_instagram_socket_timeout: int = 30
+    ytdlp_youtube_player_clients: str = "default,android,ios"
     metadata_workers: int = 2
     metadata_timeout_seconds: int = 60
 
@@ -83,6 +84,9 @@ def load_settings(base_dir: Path | None = None) -> Settings:
     js_runtimes = (os.getenv("YTDLP_JS_RUNTIMES") or "node").strip()
     remote_components = (os.getenv("YTDLP_REMOTE_COMPONENTS") or "").strip()
     instagram_impersonate = (os.getenv("YTDLP_INSTAGRAM_IMPERSONATE") or "").strip() or None
+    youtube_player_clients = (os.getenv("YTDLP_YOUTUBE_PLAYER_CLIENTS") or "default,android,ios").strip()
+    if len(youtube_player_clients) > 256:
+        raise RuntimeError("YTDLP_YOUTUBE_PLAYER_CLIENTS is too long")
 
     return Settings(
         token=token,
@@ -104,6 +108,7 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         ytdlp_instagram_retries=_integer("YTDLP_INSTAGRAM_RETRIES", 8, 0, 50),
         ytdlp_instagram_fragment_retries=_integer("YTDLP_INSTAGRAM_FRAGMENT_RETRIES", 8, 0, 50),
         ytdlp_instagram_socket_timeout=_integer("YTDLP_INSTAGRAM_SOCKET_TIMEOUT", 30, 1, 300),
+        ytdlp_youtube_player_clients=youtube_player_clients,
         metadata_workers=_integer("METADATA_WORKERS", 2, 1, 16),
         metadata_timeout_seconds=_integer("METADATA_TIMEOUT_SECONDS", 60, 5, 600),
     )

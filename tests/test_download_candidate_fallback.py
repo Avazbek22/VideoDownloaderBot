@@ -158,3 +158,98 @@ def test_instagram_fresh_extraction_keeps_same_prechecked_format(tmp_path, monke
     assert options_seen[1]["concurrent_fragment_downloads"] == 1
     assert "impersonate" not in options_seen[1]
     assert sent == ["selected"]
+
+
+def test_youtube_fresh_extraction_rechecks_same_prechecked_format(tmp_path, monkeypatch) -> None:
+    sent = _prepare(tmp_path, monkeypatch)
+    options_seen: list[dict] = []
+    process_attempt = 0
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = dict(options)
+            options_seen.append(self.options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url, download):
+            assert download is False
+            return {
+                "formats": [
+                    {
+                        "format_id": "prechecked",
+                        "ext": "mp4",
+                        "vcodec": "avc1.64001f",
+                        "acodec": "mp4a.40.2",
+                        "filesize": 100,
+                    }
+                ]
+            }
+
+        def process_ie_result(self, _metadata, download):
+            nonlocal process_attempt
+            assert download is True
+            process_attempt += 1
+            if process_attempt == 1:
+                raise RuntimeError("expired CDN URL")
+            output = Path(self.options["outtmpl"].replace("%(ext)s", "mp4"))
+            output.write_text("youtube-selected", encoding="utf-8")
+            return {"requested_downloads": [{"filepath": str(output)}]}
+
+    monkeypatch.setattr(main.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(main, "validate_media_file", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_validate_metadata_urls", lambda _metadata: None)
+
+    main._download_and_send(_job("https://www.youtube.com/watch?v=example", (_candidate("prechecked"),)))
+
+    assert process_attempt == 2
+    assert all(options["format"] == "prechecked" for options in options_seen)
+    assert options_seen[1]["concurrent_fragment_downloads"] == 1
+    assert sent == ["youtube-selected"]
+
+
+def test_youtube_fresh_extraction_never_uses_a_new_format(tmp_path, monkeypatch) -> None:
+    sent = _prepare(tmp_path, monkeypatch)
+    process_attempt = 0
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url, download):
+            assert download is False
+            return {
+                "formats": [
+                    {
+                        "format_id": "different",
+                        "ext": "mp4",
+                        "vcodec": "avc1.64001f",
+                        "acodec": "mp4a.40.2",
+                        "filesize": 100,
+                    }
+                ]
+            }
+
+        def process_ie_result(self, _metadata, download):
+            nonlocal process_attempt
+            assert download is True
+            process_attempt += 1
+            raise RuntimeError("expired CDN URL")
+
+    monkeypatch.setattr(main.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(main, "_validate_metadata_urls", lambda _metadata: None)
+
+    main._download_and_send(_job("https://www.youtube.com/watch?v=example", (_candidate("prechecked"),)))
+
+    assert process_attempt == 1
+    assert sent == []

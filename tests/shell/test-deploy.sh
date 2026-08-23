@@ -27,13 +27,46 @@ SH
 set -euo pipefail
 printf 'docker %s\n' "$*" >>"$FAKE_COMMAND_LOG"
 if [[ "$*" == *" run "* && "${FAKE_FAIL_SMOKE:-0}" == "1" ]]; then exit 1; fi
+
+image_id() {
+  if [[ "$1" == *rollback ]]; then
+    cat "$FAKE_STATE_DIR/rollback-image-id"
+  else
+    cat "$FAKE_STATE_DIR/main-image-id"
+  fi
+}
+
+if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
+  if [[ "$*" == *"--format"* ]]; then
+    image_id "$3"
+  elif [[ "$3" == *rollback ]]; then
+    [[ -s "$FAKE_STATE_DIR/rollback-image-id" ]]
+  else
+    [[ -s "$FAKE_STATE_DIR/main-image-id" ]]
+  fi
+  exit $?
+fi
+
+if [[ "${1:-}" == "image" && "${2:-}" == "tag" ]]; then
+  source_id="$(image_id "$3")"
+  if [[ "$4" == *rollback ]]; then
+    printf '%s\n' "$source_id" >"$FAKE_STATE_DIR/rollback-image-id"
+  else
+    printf '%s\n' "$source_id" >"$FAKE_STATE_DIR/main-image-id"
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "image" && "${2:-}" == "rm" ]]; then
+  exit 0
+fi
+
 case "$*" in
   "info") exit 0 ;;
   "compose version") exit 0 ;;
-  "image inspect "*) exit 0 ;;
-  "image tag "*) exit 0 ;;
   *" build "*)
     [[ "${FAKE_FAIL_BUILD:-0}" != "1" ]]
+    printf '%s\n' candidate-image >"$FAKE_STATE_DIR/main-image-id"
     : >"$FAKE_STATE_DIR/image-built"
     ;;
   *" run "*"python -m yt_dlp --version"*)
@@ -47,6 +80,7 @@ case "$*" in
   *" ps -q "*) echo fake-container ;;
   "inspect --format {{.State.Running}} fake-container") echo true ;;
   "inspect --format {{.RestartCount}} fake-container") echo 0 ;;
+  "inspect --format {{.Image}} fake-container") cat "$FAKE_STATE_DIR/running-image-id" ;;
   "inspect --format "*" fake-container")
     if [[ "${FAKE_BAD_HEALTH:-0}" == "1" ]]; then
       echo unhealthy
@@ -56,7 +90,12 @@ case "$*" in
       echo healthy
     fi
     ;;
-  *" up -d "*) exit 0 ;;
+  *" up -d "*)
+    if [[ "${FAKE_KEEP_OLD_IMAGE:-0}" != "1" ]]; then
+      cat "$FAKE_STATE_DIR/main-image-id" >"$FAKE_STATE_DIR/running-image-id"
+    fi
+    exit 0
+    ;;
 esac
 SH
   cat >"$bin/systemctl" <<'SH'
@@ -99,6 +138,9 @@ prepare_case() {
   printf '%s\n' old-commit >"$root/head"
   printf '%s\n' new-commit >"$root/target"
   printf '%s\n' main.py >"$root/changes"
+  printf '%s\n' old-image >"$root/main-image-id"
+  printf '%s\n' old-image >"$root/running-image-id"
+  : >"$root/rollback-image-id"
   : >"$root/commands.log"
   make_fake_commands "$root/bin"
 }
@@ -115,6 +157,13 @@ prepare_case "$success"
 run_script "$success" "$REPOSITORY_ROOT/scripts/deploy.sh"
 [[ "$(<"$success/head")" == new-commit ]]
 grep -q 'deployment successful commit=new-commit' "$success/logs/deploy-"*.log
+[[ "$(grep -c '{{.Image}}' "$success/commands.log")" -ge 5 ]]
+
+wrong_image="$TEST_ROOT/deploy-wrong-image"
+prepare_case "$wrong_image"
+if run_script "$wrong_image" "$REPOSITORY_ROOT/scripts/deploy.sh" FAKE_KEEP_OLD_IMAGE=1; then exit 1; fi
+[[ "$(<"$wrong_image/head")" == old-commit ]]
+grep -q 'image rm candidate-image' "$wrong_image/commands.log"
 
 docs="$TEST_ROOT/docs"
 prepare_case "$docs"
@@ -196,6 +245,7 @@ if grep -q ' up -d ' "$updater_same/commands.log"; then
 fi
 grep -q 'yt-dlp already up to date' "$updater_same/logs/updater-"*.log
 grep -q 'image tag videodownloaderbot:rollback videodownloaderbot:local' "$updater_same/commands.log"
+grep -q 'image rm candidate-image' "$updater_same/commands.log"
 
 installer="$TEST_ROOT/installer-rollback"
 prepare_case "$installer"

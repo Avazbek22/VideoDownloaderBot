@@ -25,6 +25,7 @@ def _clean(monkeypatch: pytest.MonkeyPatch) -> None:
         "LOG_LEVEL",
         "YTDLP_JS_RUNTIMES",
         "YTDLP_REMOTE_COMPONENTS",
+        "YTDLP_YOUTUBE_PLAYER_CLIENTS",
         "YTDLP_INSTAGRAM_IMPERSONATE",
         "YTDLP_INSTAGRAM_RETRIES",
         "YTDLP_INSTAGRAM_FRAGMENT_RETRIES",
@@ -61,6 +62,7 @@ def test_ytdlp_and_metadata_settings_are_loaded_from_local_env(tmp_path, monkeyp
                 "BOT_TOKEN=123:test-token-value-abcdefghijklmnop",
                 "YTDLP_JS_RUNTIMES=node:/custom/node",
                 "YTDLP_REMOTE_COMPONENTS=",
+                "YTDLP_YOUTUBE_PLAYER_CLIENTS=default,android,ios",
                 "YTDLP_INSTAGRAM_IMPERSONATE=",
                 "YTDLP_INSTAGRAM_RETRIES=3",
                 "YTDLP_INSTAGRAM_FRAGMENT_RETRIES=4",
@@ -76,6 +78,7 @@ def test_ytdlp_and_metadata_settings_are_loaded_from_local_env(tmp_path, monkeyp
 
     assert settings.ytdlp_js_runtimes == "node:/custom/node"
     assert settings.ytdlp_remote_components == ""
+    assert settings.ytdlp_youtube_player_clients == "default,android,ios"
     assert settings.ytdlp_instagram_impersonate is None
     assert settings.ytdlp_instagram_retries == 3
     assert settings.ytdlp_instagram_fragment_retries == 4

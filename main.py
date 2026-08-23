@@ -50,10 +50,13 @@ from app.planner import build_video_candidates as _build_video_candidates
 from app.planner import (
     get_video_meta as _get_video_meta,
 )
+from app.planner import has_downloadable_video as _has_downloadable_video
 from app.planner import (
     is_instagram_url as _is_instagram_url,
 )
+from app.planner import is_youtube_url as _is_youtube_url
 from app.planner import metadata_without_format_selection as _metadata_without_format_selection
+from app.planner import youtube_player_clients as _youtube_player_clients
 from app.settings import Settings, load_settings
 from app.temp_files import cleanup_directory_contents, cleanup_job_directory, cleanup_stale_directories
 from app.text_utils import (
@@ -356,6 +359,30 @@ def _find_downloaded_file(
 
 def _get_video_meta_with_hidden_retries(url: str) -> dict[str, Any]:
     settings = _settings()
+    if _is_youtube_url(url):
+        last_error: Exception | None = None
+        for player_client in _youtube_player_clients(settings.ytdlp_youtube_player_clients):
+            try:
+                meta = _get_video_meta(
+                    url,
+                    js_runtimes=settings.ytdlp_js_runtimes,
+                    remote_components=settings.ytdlp_remote_components,
+                    cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
+                    youtube_player_client=player_client,
+                )
+                if not isinstance(meta, dict) or not _has_downloadable_video(meta):
+                    raise RuntimeError("extractor returned metadata without a downloadable video")
+                _validate_metadata_urls(meta)
+                return meta
+            except Exception as exc:
+                last_error = exc
+                LOGGER.info(
+                    "YouTube metadata client failed client=%s",
+                    player_client or "default",
+                    exc_info=True,
+                )
+        raise RuntimeError("all YouTube metadata clients failed") from last_error
+
     try:
         meta = _get_video_meta(
             url,
@@ -464,7 +491,11 @@ def _download_and_send(job: DownloadJob) -> None:
     file_path: str | None = None
     settings = _settings()
 
-    def build_options(plan: VideoFormatCandidate | dict[str, Any], tmp_id: str) -> dict[str, Any]:
+    def build_options(
+        plan: VideoFormatCandidate | dict[str, Any],
+        tmp_id: str,
+        youtube_player_client: str | None = None,
+    ) -> dict[str, Any]:
         progress_state: dict[str, Any] = {"pct": 0}
 
         def progress_hook(data: dict[str, Any]) -> None:
@@ -514,6 +545,7 @@ def _download_and_send(job: DownloadJob) -> None:
             url,
             settings.ytdlp_js_runtimes,
             settings.ytdlp_remote_components,
+            player_client=youtube_player_client,
         )
         _apply_instagram_stability_opts(
             options,
@@ -566,7 +598,49 @@ def _download_and_send(job: DownloadJob) -> None:
                 raise
             except Exception:
                 _check_job(job_id, deadline)
-                if not _is_instagram_url(url):
+                if _is_youtube_url(url) and mode != "audio":
+                    recovered = False
+                    for player_client in _youtube_player_clients(settings.ytdlp_youtube_player_clients):
+                        _check_job(job_id, deadline)
+                        cleanup_directory_contents(job_dir)
+                        tmp_id = uuid.uuid4().hex
+                        options = build_options(plan, tmp_id, youtube_player_client=player_client)
+                        options["concurrent_fragment_downloads"] = 1
+                        try:
+                            with yt_dlp.YoutubeDL(options) as ydl:
+                                fresh_metadata = ydl.extract_info(url, download=False)
+                            _check_job(job_id, deadline)
+                            if not isinstance(fresh_metadata, dict) or not _has_downloadable_video(fresh_metadata):
+                                raise RuntimeError("extractor returned metadata without a downloadable video")
+                            _validate_metadata_urls(fresh_metadata)
+                            fresh_candidates = _build_video_candidates(fresh_metadata, MAX_SEND_BYTES)
+                            if not any(
+                                candidate.format_spec == plan.get("format_spec") for candidate in fresh_candidates
+                            ):
+                                raise RuntimeError("fresh metadata did not prove the prechecked format")
+                            with yt_dlp.YoutubeDL(options) as ydl:
+                                info = ydl.process_ie_result(
+                                    _metadata_without_format_selection(fresh_metadata),
+                                    download=True,
+                                )
+                            _check_job(job_id, deadline)
+                            recovered = True
+                            break
+                        except (JobCancelled, JobTimedOut):
+                            raise
+                        except Exception:
+                            LOGGER.warning(
+                                "YouTube fresh extraction candidate failed job_id=%s candidate=%s client=%s",
+                                job_id,
+                                plan.get("format_spec"),
+                                player_client or "default",
+                                exc_info=True,
+                            )
+                            _check_job(job_id, deadline)
+                    if not recovered:
+                        cleanup_directory_contents(job_dir)
+                        continue
+                elif not _is_instagram_url(url):
                     LOGGER.warning(
                         "download candidate failed job_id=%s stage=download candidate=%s attempt=%s/%s",
                         job_id,
@@ -577,33 +651,34 @@ def _download_and_send(job: DownloadJob) -> None:
                     )
                     cleanup_directory_contents(job_dir)
                     continue
-                LOGGER.info(
-                    "Instagram fresh extraction retry job_id=%s stage=download candidate=%s",
-                    job_id,
-                    plan.get("format_spec"),
-                    exc_info=True,
-                )
-                cleanup_directory_contents(job_dir)
-                tmp_id = uuid.uuid4().hex
-                options = build_options(plan, tmp_id)
-                options.pop("impersonate", None)
-                options["concurrent_fragment_downloads"] = 1
-                try:
-                    with yt_dlp.YoutubeDL(options) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                except (JobCancelled, JobTimedOut):
-                    raise
-                except Exception:
-                    LOGGER.warning(
-                        "Instagram candidate failed after fresh extraction job_id=%s candidate=%s attempt=%s/%s",
+                else:
+                    LOGGER.info(
+                        "Instagram fresh extraction retry job_id=%s stage=download candidate=%s",
                         job_id,
                         plan.get("format_spec"),
-                        index,
-                        len(plans),
                         exc_info=True,
                     )
                     cleanup_directory_contents(job_dir)
-                    continue
+                    tmp_id = uuid.uuid4().hex
+                    options = build_options(plan, tmp_id)
+                    options.pop("impersonate", None)
+                    options["concurrent_fragment_downloads"] = 1
+                    try:
+                        with yt_dlp.YoutubeDL(options) as ydl:
+                            info = ydl.extract_info(url, download=True)
+                    except (JobCancelled, JobTimedOut):
+                        raise
+                    except Exception:
+                        LOGGER.warning(
+                            "Instagram candidate failed after fresh extraction job_id=%s candidate=%s attempt=%s/%s",
+                            job_id,
+                            plan.get("format_spec"),
+                            index,
+                            len(plans),
+                            exc_info=True,
+                        )
+                        cleanup_directory_contents(job_dir)
+                        continue
 
             try:
                 _check_job(job_id, deadline)

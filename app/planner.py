@@ -76,6 +76,7 @@ def apply_youtube_runtime_opts(
     url: str,
     js_runtimes: str | None,
     remote_components: str | None,
+    player_client: str | None = None,
 ) -> dict[str, Any]:
     if not is_youtube_url(url):
         return opts
@@ -99,7 +100,41 @@ def apply_youtube_runtime_opts(
         comps = [x.strip() for x in str(remote_components).split(",") if x.strip()]
         if comps:
             opts["remote_components"] = comps
+    if player_client:
+        opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
     return opts
+
+
+def youtube_player_clients(raw: str | None) -> list[str | None]:
+    """Return a stable yt-dlp client fallback chain; None means yt-dlp's default."""
+    configured = [item.strip().lower() for item in str(raw or "").split(",") if item.strip()]
+    if not configured:
+        configured = ["default", "android", "ios"]
+
+    result: list[str | None] = []
+    for item in configured:
+        client = None if item in {"default", "web"} else item
+        if client not in result:
+            result.append(client)
+    return result or [None, "android", "ios"]
+
+
+def has_downloadable_video(meta: dict[str, Any]) -> bool:
+    """Return whether metadata identifies a video, including codec-less Instagram MP4."""
+    formats = [item for item in meta.get("formats", []) or [] if isinstance(item, dict)]
+    for item in [meta, *formats]:
+        vcodec = item.get("vcodec")
+        if vcodec not in (None, "", "none"):
+            return True
+        if (
+            str(item.get("ext") or "").lower() == "mp4"
+            and not vcodec
+            and not item.get("acodec")
+            and isinstance(item.get("url"), str)
+        ):
+            return True
+    entries = [item for item in meta.get("entries", []) or [] if isinstance(item, dict)]
+    return any(has_downloadable_video(item) for item in entries)
 
 
 def apply_instagram_stability_opts(
@@ -193,11 +228,18 @@ def get_video_meta(
     instagram_fragment_retries: int | None = None,
     instagram_socket_timeout: int | None = None,
     cookies_file: str | None = None,
+    youtube_player_client: str | None = None,
 ) -> dict[str, Any]:
     ydl_opts: dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
     if cookies_file:
         ydl_opts["cookiefile"] = cookies_file
-    ydl_opts = apply_youtube_runtime_opts(ydl_opts, url, js_runtimes, remote_components)
+    ydl_opts = apply_youtube_runtime_opts(
+        ydl_opts,
+        url,
+        js_runtimes,
+        remote_components,
+        player_client=youtube_player_client,
+    )
     ydl_opts = apply_instagram_stability_opts(
         ydl_opts,
         url,

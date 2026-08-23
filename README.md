@@ -211,6 +211,7 @@ Operational settings are read through the validated `Settings` dataclass:
 * `YTDLP_CONCURRENT_FRAGMENTS` — segmented download concurrency; default `4`
 * `YTDLP_JS_RUNTIMES` — yt-dlp JavaScript runtimes; default `node`
 * `YTDLP_REMOTE_COMPONENTS` — optional yt-dlp remote components; empty disables them
+* `YTDLP_YOUTUBE_PLAYER_CLIENTS` — ordered metadata fallback clients; default `default,android,ios`
 * `YTDLP_INSTAGRAM_IMPERSONATE` — optional Instagram impersonation target
 * `YTDLP_INSTAGRAM_RETRIES`, `YTDLP_INSTAGRAM_FRAGMENT_RETRIES`, `YTDLP_INSTAGRAM_SOCKET_TIMEOUT` — bounded Instagram retry/timeouts
 * `METADATA_WORKERS` — maximum concurrent metadata operations; default `2`

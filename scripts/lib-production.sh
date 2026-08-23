@@ -9,7 +9,8 @@ compose() {
 }
 
 wait_until_stable() {
-  local container_id running restarts health attempt stable=0
+  local expected_image_id="${1:-}"
+  local container_id container_image running restarts health attempt stable=0
   for ((attempt = 1; attempt <= 30; attempt++)); do
     container_id="$(compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" ps -q "$SERVICE_KEY")"
     if [[ -n "$container_id" ]]; then
@@ -18,7 +19,9 @@ wait_until_stable() {
       health="$(docker inspect \
         --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
         "$container_id" 2>/dev/null || printf unknown)"
-      if [[ "$running" == "true" && "$restarts" == "0" && "$health" == "healthy" ]]; then
+      container_image="$(docker inspect --format '{{.Image}}' "$container_id" 2>/dev/null || printf unknown)"
+      if [[ "$running" == "true" && "$restarts" == "0" && "$health" == "healthy" ]] \
+          && [[ -z "$expected_image_id" || "$container_image" == "$expected_image_id" ]]; then
         stable=$((stable + 1))
         [[ "$stable" -ge 5 ]] && return 0
       else

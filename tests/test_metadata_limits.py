@@ -11,6 +11,28 @@ import main
 from app.settings import Settings
 
 
+def test_youtube_metadata_skips_client_without_downloadable_video(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    settings = Settings(**{**settings.__dict__, "ytdlp_youtube_player_clients": "default,android,ios"})
+    main.SETTINGS = settings
+    clients_seen: list[str | None] = []
+
+    def fake_get_video_meta(_url, **kwargs):
+        client = kwargs.get("youtube_player_client")
+        clients_seen.append(client)
+        if client is None:
+            return {"formats": []}
+        return {"formats": [{"format_id": "18", "vcodec": "avc1.42001e", "acodec": "mp4a"}]}
+
+    monkeypatch.setattr(main, "_get_video_meta", fake_get_video_meta)
+    monkeypatch.setattr(main, "_validate_metadata_urls", lambda _metadata: None)
+
+    metadata = main._get_video_meta_with_hidden_retries("https://www.youtube.com/watch?v=example")
+
+    assert metadata["formats"][0]["format_id"] == "18"
+    assert clients_seen == [None, "android"]
+
+
 def _settings(tmp_path: Path, *, workers: int = 1, timeout: int = 5) -> Settings:
     return Settings(
         token="123:test-token-value-abcdefghijklmnop",

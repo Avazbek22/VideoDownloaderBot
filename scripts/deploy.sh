@@ -17,6 +17,8 @@ old_commit=""
 target_commit=""
 deployment_started=0
 replacement_attempted=0
+candidate_image_id=""
+previous_image_id=""
 units_changed=0
 units_backup=""
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
@@ -30,8 +32,13 @@ rollback() {
   trap - ERR INT TERM
   if [[ "$deployment_started" == "1" ]]; then
     log "deployment failed; restoring commit=$old_commit"
+    local image_restored=0
     if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
-      docker image tag "$ROLLBACK_IMAGE" "$IMAGE_NAME" || log "failed to restore rollback image tag"
+      if docker image tag "$ROLLBACK_IMAGE" "$IMAGE_NAME"; then
+        image_restored=1
+      else
+        log "failed to restore rollback image tag"
+      fi
     fi
     git -C "$ROOT_DIR" checkout -q -B "$DEPLOY_BRANCH" "$old_commit" || log "failed to restore checkout"
     if [[ "$units_changed" == "1" ]]; then
@@ -40,10 +47,23 @@ rollback() {
     if [[ "$replacement_attempted" == "1" ]]; then
       compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" \
         up -d --no-deps --force-recreate "$SERVICE_KEY" || log "failed to recreate rollback container"
+      if [[ "$image_restored" == "1" ]] && ! wait_until_stable "$previous_image_id"; then
+        log "rollback container did not return to a stable healthy state"
+      fi
     fi
+    cleanup_candidate_image
     printf '%s\n' "$target_commit" >"$FAILED_SHA_FILE"
   fi
   exit "$code"
+}
+
+cleanup_candidate_image() {
+  [[ -n "$candidate_image_id" ]] || return 0
+  local current_image_id
+  current_image_id="$(docker image inspect "$IMAGE_NAME" --format '{{.Id}}' 2>/dev/null || true)"
+  [[ "$candidate_image_id" != "$current_image_id" ]] || return 0
+  docker image rm "$candidate_image_id" >/dev/null 2>&1 \
+    || log "candidate image cleanup skipped id=$candidate_image_id"
 }
 
 unit_names=(
@@ -157,7 +177,8 @@ main() {
     return 0
   fi
 
-  docker image inspect "$IMAGE_NAME" >/dev/null 2>&1 || { log "current image is unavailable"; return 1; }
+  previous_image_id="$(docker image inspect "$IMAGE_NAME" --format '{{.Id}}' 2>/dev/null || true)"
+  [[ -n "$previous_image_id" ]] || { log "current image is unavailable"; return 1; }
   docker image tag "$IMAGE_NAME" "$ROLLBACK_IMAGE"
   deployment_started=1
   trap rollback ERR INT TERM
@@ -172,11 +193,13 @@ main() {
     install_systemd_units
   fi
   compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" build --pull "$SERVICE_KEY"
+  candidate_image_id="$(docker image inspect "$IMAGE_NAME" --format '{{.Id}}' 2>/dev/null || true)"
+  [[ -n "$candidate_image_id" ]] || { log "built image cannot be identified"; return 1; }
   smoke_test_image
   replacement_attempted=1
   compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" \
     up -d --no-deps --force-recreate "$SERVICE_KEY"
-  wait_until_stable
+  wait_until_stable "$candidate_image_id"
 
   rm -f "$FAILED_SHA_FILE"
   deployment_started=0
