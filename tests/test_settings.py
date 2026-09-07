@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from app.planner import apply_youtube_runtime_opts
+from app.planner import apply_generic_impersonation_opts, apply_youtube_runtime_opts
 from app.settings import load_settings
 
 
@@ -30,6 +30,7 @@ def _clean(monkeypatch: pytest.MonkeyPatch) -> None:
         "YTDLP_INSTAGRAM_RETRIES",
         "YTDLP_INSTAGRAM_FRAGMENT_RETRIES",
         "YTDLP_INSTAGRAM_SOCKET_TIMEOUT",
+        "YTDLP_GENERIC_IMPERSONATE",
         "METADATA_WORKERS",
         "METADATA_TIMEOUT_SECONDS",
     ):
@@ -67,6 +68,7 @@ def test_ytdlp_and_metadata_settings_are_loaded_from_local_env(tmp_path, monkeyp
                 "YTDLP_INSTAGRAM_RETRIES=3",
                 "YTDLP_INSTAGRAM_FRAGMENT_RETRIES=4",
                 "YTDLP_INSTAGRAM_SOCKET_TIMEOUT=25",
+                "YTDLP_GENERIC_IMPERSONATE=chrome",
                 "METADATA_WORKERS=3",
                 "METADATA_TIMEOUT_SECONDS=45",
             ]
@@ -83,6 +85,7 @@ def test_ytdlp_and_metadata_settings_are_loaded_from_local_env(tmp_path, monkeyp
     assert settings.ytdlp_instagram_retries == 3
     assert settings.ytdlp_instagram_fragment_retries == 4
     assert settings.ytdlp_instagram_socket_timeout == 25
+    assert settings.ytdlp_generic_impersonate == "chrome"
     assert settings.metadata_workers == 3
     assert settings.metadata_timeout_seconds == 45
     options = apply_youtube_runtime_opts(
@@ -92,6 +95,17 @@ def test_ytdlp_and_metadata_settings_are_loaded_from_local_env(tmp_path, monkeyp
         settings.ytdlp_remote_components,
     )
     assert "remote_components" not in options
+    generic_options = apply_generic_impersonation_opts(
+        {},
+        "https://example.com/video",
+        settings.ytdlp_generic_impersonate,
+    )
+    assert "impersonate" in generic_options
+    assert "impersonate" not in apply_generic_impersonation_opts(
+        {},
+        "https://www.youtube.com/watch?v=example",
+        settings.ytdlp_generic_impersonate,
+    )
 
 
 def test_invalid_metadata_configuration_is_rejected(tmp_path, monkeypatch) -> None:

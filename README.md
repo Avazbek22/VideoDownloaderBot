@@ -133,7 +133,7 @@ docker compose logs -f --tail=200 || docker-compose logs -f --tail=200
 (docker compose up -d || docker-compose up -d)
 ```
 
-Runtime logs are also written to `logs/bot.log`. Downloads use per-job directories under `data/downloads/`; both directories survive deployment and rollback.
+Runtime logs are also written to `logs/bot.log`. Downloads use per-job directories under `data/downloads/`; both directories survive deployment and rollback. Docker pins the download workspace to `/app/data/downloads`, so a legacy `.env` value cannot redirect media into the bounded `/tmp` tmpfs.
 
 ### Automatic deployment and rollback
 
@@ -141,7 +141,7 @@ Runtime logs are also written to `logs/bot.log`. Downloads use per-job directori
 
 If build, preflight, container startup, or health stabilization fails, the previous Git commit and Docker image are restored. Changed systemd unit files are refreshed transactionally and restored too if deployment fails. The failed SHA is stored in `data/.failed-deploy-sha` and is not retried until a newer commit arrives. Daily deployment logs are stored in `logs/deploy-YYYY-MM-DD.log` for 60 days.
 
-`videodownloaderbot-yt-dlp-update.timer` performs a nightly image rebuild using `YTDLP_CACHEBUST`. It never runs `pip install` inside the running container, does not pull a new base image, and does not restart the bot when yt-dlp is already current. A changed update rolls back to the previous image if validation or startup fails. Updater logs are stored in `logs/updater-YYYY-MM-DD.log`.
+`videodownloaderbot-yt-dlp-update.timer` performs a nightly image rebuild using `YTDLP_CACHEBUST`. It never runs `pip install` inside the running container, does not pull a new base image, and does not restart the bot when yt-dlp is already current. If the expected local image tag is missing or stale, it can recover it only from the single healthy container with matching Compose labels. A changed update rolls back to the previous image if validation or startup fails. Updater logs are stored in `logs/updater-YYYY-MM-DD.log`.
 
 ---
 
@@ -200,7 +200,7 @@ LOGS_DIR=/app/logs
 Operational settings are read through the validated `Settings` dataclass:
 
 * `LOGS_CHAT_ID` — optional operator chat for critical failures
-* `OUTPUT_FOLDER` — temporary per-job directories
+* `OUTPUT_FOLDER` — temporary per-job directories; Docker enforces `/app/data/downloads`
 * `LOGS_DIR` — rotating application logs
 * `MAX_FILESIZE` — strict upload limit; defaults to `52428800` bytes (50 MiB)
 * `WORKERS` — download workers; default `2`
@@ -214,6 +214,7 @@ Operational settings are read through the validated `Settings` dataclass:
 * `YTDLP_YOUTUBE_PLAYER_CLIENTS` — ordered metadata fallback clients; default `default,android,ios`
 * `YTDLP_INSTAGRAM_IMPERSONATE` — optional Instagram impersonation target
 * `YTDLP_INSTAGRAM_RETRIES`, `YTDLP_INSTAGRAM_FRAGMENT_RETRIES`, `YTDLP_INSTAGRAM_SOCKET_TIMEOUT` — bounded Instagram retry/timeouts
+* `YTDLP_GENERIC_IMPERSONATE` — optional browser impersonation target for generic sites; default `chrome`
 * `METADATA_WORKERS` — maximum concurrent metadata operations; default `2`
 * `METADATA_TIMEOUT_SECONDS` — metadata-stage timeout; default `60`
 * `COOKIES_FILE` — optional cookies file, normally `/app/data/cookies.txt`
@@ -264,7 +265,7 @@ docker compose up -d
 docker compose ps
 ```
 
-The container root filesystem is read-only. Only `data/`, `logs/`, and the in-memory `/tmp` filesystem are writable; Docker health is based on a fresh `/tmp/videodownloaderbot.healthy` heartbeat.
+The container root filesystem is read-only. Only `data/`, `logs/`, and the in-memory `/tmp` filesystem are writable; Docker health is based on a fresh `/tmp/videodownloaderbot.healthy` heartbeat. Progress hooks stop a download when its actual byte count or reported total exceeds `MAX_FILESIZE`; `max_filesize` metadata checks alone are not treated as a hard streaming limit.
 
 ---
 

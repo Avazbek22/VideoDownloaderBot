@@ -114,7 +114,18 @@ def render_status(
 
 def find_file_by_prefix(output_folder: str, prefix: str, prefer_ext: str | None = None) -> str | None:
     try:
-        files = [fn for fn in os.listdir(output_folder) if fn.startswith(prefix)]
+        files: list[str] = []
+        for filename in os.listdir(output_folder):
+            if not filename.startswith(prefix):
+                continue
+            lower = filename.lower()
+            if lower.endswith((".part", ".ytdl", ".tmp", ".temp")):
+                continue
+            suffix = lower[len(prefix) :]
+            if suffix.startswith(".f") and suffix[2:].split(".", 1)[0].isdigit():
+                continue
+            if os.path.isfile(os.path.join(output_folder, filename)):
+                files.append(filename)
         if not files:
             return None
 

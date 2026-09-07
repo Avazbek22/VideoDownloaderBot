@@ -9,6 +9,10 @@ services:
     init: true
     env_file:
       - .env
+    environment:
+      # Downloads must stay on the bind-mounted VPS filesystem even if an old
+      # .env still contains the legacy /tmp workspace.
+      OUTPUT_FOLDER: /app/data/downloads
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

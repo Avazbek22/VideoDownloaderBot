@@ -118,6 +118,9 @@ rollback_install() {
 prepare_repository() {
   info "Preparing origin/main checkout"
   if [[ -d "$INSTALL_DIR/.git" ]]; then
+    # Executable modes are applied below for the production host. Avoid making
+    # those intentional mode-only changes block future content deployments.
+    git -C "$INSTALL_DIR" config core.fileMode false
     [[ -z "$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=no)" ]] \
       || die "Tracked local changes detected in $INSTALL_DIR"
     git -C "$INSTALL_DIR" fetch origin "$BRANCH"
@@ -126,6 +129,7 @@ prepare_repository() {
   else
     git clone --branch "$BRANCH" --single-branch "$REPOSITORY" "$INSTALL_DIR"
   fi
+  git -C "$INSTALL_DIR" config core.fileMode false
   ok "Repository is ready at $INSTALL_DIR"
 }
 

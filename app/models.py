@@ -14,6 +14,7 @@ class VideoFormatCandidate:
     quality_label: str
     compatibility: int
     direct_urls: tuple[str, ...]
+    size_source: str = "exact"
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)

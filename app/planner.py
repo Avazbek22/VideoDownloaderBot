@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 from copy import deepcopy
 from typing import Any
@@ -13,6 +14,8 @@ from app.text_utils import fmt_bytes
 from app.url_security import MAX_REDIRECTS, domain_matches, validate_public_url, validate_redirect
 
 AUDIO_HEADROOM_BYTES = 1_500_000
+FRAGMENTED_SIZE_FACTOR = 1.25
+FRAGMENTED_SIZE_HEADROOM_BYTES = 1024 * 1024
 LOGGER = logging.getLogger(__name__)
 H264_PREFIXES = ("avc1", "avc3", "h264")
 FORMAT_SELECTION_FIELDS = frozenset(
@@ -164,6 +167,20 @@ def apply_instagram_stability_opts(
     return opts
 
 
+def apply_generic_impersonation_opts(
+    opts: dict[str, Any],
+    url: str,
+    impersonate: str | None,
+) -> dict[str, Any]:
+    if not impersonate or is_youtube_url(url) or is_instagram_url(url):
+        return opts
+    try:
+        opts["impersonate"] = ImpersonateTarget.from_str(str(impersonate).strip())
+    except Exception:
+        LOGGER.debug("invalid generic yt-dlp impersonation target", exc_info=True)
+    return opts
+
+
 def probe_url_size_bytes(url: str, timeout_sec: int = 10) -> int | None:
     """
     Try to get real content size without downloading the file:
@@ -229,6 +246,7 @@ def get_video_meta(
     instagram_socket_timeout: int | None = None,
     cookies_file: str | None = None,
     youtube_player_client: str | None = None,
+    generic_impersonate: str | None = None,
 ) -> dict[str, Any]:
     ydl_opts: dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
     if cookies_file:
@@ -248,6 +266,7 @@ def get_video_meta(
         fragment_retries=instagram_fragment_retries,
         socket_timeout=instagram_socket_timeout,
     )
+    ydl_opts = apply_generic_impersonation_opts(ydl_opts, url, generic_impersonate)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -262,7 +281,8 @@ def _duration_sec(meta: dict[str, Any]) -> int | None:
 def _format_size_bytes(fmt: dict[str, Any], dur: int | None) -> tuple[int | None, bool]:
     """
     Returns (size_bytes, confident).
-    confident=True when size comes from 'filesize' or 'filesize_approx' or URL probe.
+    confident=True when size comes from 'filesize', a complete fragment list,
+    or a URL probe. Fragmented 'filesize_approx' values remain approximate.
     """
     fs = fmt.get("filesize")
     if isinstance(fs, int) and fs > 0:
@@ -270,6 +290,8 @@ def _format_size_bytes(fmt: dict[str, Any], dur: int | None) -> tuple[int | None
 
     fsa = fmt.get("filesize_approx")
     if isinstance(fsa, int) and fsa > 0:
+        if _is_fragmented_format(fmt):
+            return _fragmented_estimate(fsa), False
         return fsa, True
 
     # Bitrate estimation is NOT confident (we don't use it to block/allow).
@@ -297,16 +319,62 @@ def _positive_number(value: Any) -> float:
     return float(value) if isinstance(value, (int, float)) and value > 0 else 0.0
 
 
-def _proven_component_size(fmt: dict[str, Any]) -> int | None:
-    for field in ("filesize", "filesize_approx"):
-        value = fmt.get(field)
-        if isinstance(value, int) and value > 0:
-            return value
-    url = fmt.get("url")
-    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+def _is_fragmented_format(fmt: dict[str, Any]) -> bool:
+    protocol = str(fmt.get("protocol") or "").lower()
+    return bool(
+        fmt.get("manifest_url")
+        or bool(fmt.get("fragments"))
+        or any(marker in protocol for marker in ("m3u8", "dash", "http_dash_segments", "ism"))
+    )
+
+
+def _fragmented_estimate(value: int) -> int:
+    return math.ceil(value * FRAGMENTED_SIZE_FACTOR) + FRAGMENTED_SIZE_HEADROOM_BYTES
+
+
+def _complete_fragment_size(fmt: dict[str, Any]) -> int | None:
+    fragments = fmt.get("fragments")
+    if not isinstance(fragments, list) or not fragments:
         return None
-    size = probe_url_size_bytes(url)
-    return size if isinstance(size, int) and size > 0 else None
+    total = 0
+    for fragment in fragments:
+        if not isinstance(fragment, dict):
+            return None
+        value = next(
+            (
+                fragment.get(field)
+                for field in ("filesize", "size", "content_length")
+                if isinstance(fragment.get(field), int) and fragment[field] > 0
+            ),
+            None,
+        )
+        if value is None:
+            return None
+        total += value
+    return total or None
+
+
+def _component_size(fmt: dict[str, Any]) -> tuple[int | None, bool, str]:
+    exact = fmt.get("filesize")
+    if isinstance(exact, int) and exact > 0:
+        return exact, True, "filesize"
+
+    fragment_total = _complete_fragment_size(fmt)
+    if fragment_total is not None:
+        return fragment_total, True, "fragments"
+
+    approximate = fmt.get("filesize_approx")
+    if isinstance(approximate, int) and approximate > 0:
+        if _is_fragmented_format(fmt):
+            return _fragmented_estimate(approximate), False, "fragmented-approximate"
+        return approximate, True, "filesize-approximate"
+
+    url = fmt.get("url")
+    if isinstance(url, str) and url.startswith(("http://", "https://")) and not _is_fragmented_format(fmt):
+        size = probe_url_size_bytes(url)
+        if isinstance(size, int) and size > 0:
+            return size, True, "content-range"
+    return None, False, "unknown"
 
 
 def _direct_urls(*formats: dict[str, Any]) -> tuple[str, ...]:
@@ -318,7 +386,7 @@ def _direct_urls(*formats: dict[str, Any]) -> tuple[str, ...]:
 
 
 def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[VideoFormatCandidate]:
-    """Return only preflight-size-proven, Telegram-compatible candidates, best first."""
+    """Return size-screened, Telegram-compatible candidates, best first."""
     formats = [item for item in meta.get("formats", []) or [] if isinstance(item, dict)]
     instagram = is_instagram_url(str(meta.get("webpage_url") or meta.get("original_url") or ""))
     raw: list[tuple[tuple[float, ...], VideoFormatCandidate]] = []
@@ -340,7 +408,7 @@ def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[Video
             continue
         if has_known_h264 and acodec in (None, "", "none"):
             continue
-        size = _proven_component_size(fmt)
+        size, confident, size_source = _component_size(fmt)
         if size is None or size > limit_bytes:
             continue
         format_id = fmt.get("format_id")
@@ -354,10 +422,11 @@ def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[Video
             format_spec=str(format_id),
             merge_output_format=None,
             estimated_size=size,
-            estimated_confident=True,
+            estimated_confident=confident,
             quality_label=f"{height}p" if height else "mp4",
             compatibility=compatibility,
             direct_urls=_direct_urls(fmt),
+            size_source=size_source,
         )
         raw.append(((compatibility, height, fps, bitrate), candidate))
 
@@ -373,15 +442,15 @@ def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[Video
         key=lambda fmt: (_positive_number(fmt.get("abr")), _positive_number(fmt.get("tbr"))),
         reverse=True,
     )
-    proven_audio: tuple[dict[str, Any], int] | None = None
+    proven_audio: tuple[dict[str, Any], int, bool, str] | None = None
     for audio in audio_formats:
-        audio_size = _proven_component_size(audio)
+        audio_size, audio_confident, audio_source = _component_size(audio)
         if audio_size is not None:
-            proven_audio = (audio, audio_size)
+            proven_audio = (audio, audio_size, audio_confident, audio_source)
             break
 
     if proven_audio:
-        audio, audio_size = proven_audio
+        audio, audio_size, audio_confident, audio_source = proven_audio
         for video in formats:
             if (
                 str(video.get("ext") or "").lower() != "mp4"
@@ -390,7 +459,7 @@ def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[Video
                 or video.get("format_id") is None
             ):
                 continue
-            video_size = _proven_component_size(video)
+            video_size, video_confident, video_source = _component_size(video)
             if video_size is None or video_size + audio_size > limit_bytes:
                 continue
             height = int(_positive_number(video.get("height")))
@@ -400,10 +469,13 @@ def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[Video
                 format_spec=f"{video['format_id']}+{audio['format_id']}",
                 merge_output_format="mp4",
                 estimated_size=video_size + audio_size,
-                estimated_confident=True,
+                estimated_confident=video_confident and audio_confident,
                 quality_label=f"{height}p" if height else "mp4",
                 compatibility=2,
                 direct_urls=_direct_urls(video, audio),
+                size_source=(
+                    video_source if video_source == audio_source else f"{video_source}+{audio_source}"
+                ),
             )
             raw.append(((2, height, fps, bitrate), candidate))
 

@@ -57,6 +57,7 @@ class Settings:
     ytdlp_youtube_player_clients: str = "default,android,ios"
     metadata_workers: int = 2
     metadata_timeout_seconds: int = 60
+    ytdlp_generic_impersonate: str | None = "chrome"
 
 
 def load_settings(base_dir: Path | None = None) -> Settings:
@@ -84,6 +85,7 @@ def load_settings(base_dir: Path | None = None) -> Settings:
     js_runtimes = (os.getenv("YTDLP_JS_RUNTIMES") or "node").strip()
     remote_components = (os.getenv("YTDLP_REMOTE_COMPONENTS") or "").strip()
     instagram_impersonate = (os.getenv("YTDLP_INSTAGRAM_IMPERSONATE") or "").strip() or None
+    generic_impersonate = (os.getenv("YTDLP_GENERIC_IMPERSONATE") or "chrome").strip() or None
     youtube_player_clients = (os.getenv("YTDLP_YOUTUBE_PLAYER_CLIENTS") or "default,android,ios").strip()
     if len(youtube_player_clients) > 256:
         raise RuntimeError("YTDLP_YOUTUBE_PLAYER_CLIENTS is too long")
@@ -111,4 +113,5 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         ytdlp_youtube_player_clients=youtube_player_clients,
         metadata_workers=_integer("METADATA_WORKERS", 2, 1, 16),
         metadata_timeout_seconds=_integer("METADATA_TIMEOUT_SECONDS", 60, 5, 600),
+        ytdlp_generic_impersonate=generic_impersonate,
     )

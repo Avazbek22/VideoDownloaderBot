@@ -20,6 +20,13 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncod
 from telebot import types
 from telebot.util import quick_markup
 
+from app.download_guard import (
+    DownloadByteLimiter,
+    DownloadStorageError,
+    is_download_size_error,
+    is_enospc_error,
+    raise_if_terminal_storage_error,
+)
 from app.download_utils import (
     calc_download_progress as _calc_download_progress,
 )
@@ -37,6 +44,9 @@ from app.http_utils import telegram_upload_session
 from app.logging_setup import configure_logging
 from app.media_validation import validate_media_file
 from app.models import ActiveJob, DownloadJob, PendingRequest, VideoFormatCandidate
+from app.planner import (
+    apply_generic_impersonation_opts as _apply_generic_impersonation_opts,
+)
 from app.planner import (
     apply_instagram_stability_opts as _apply_instagram_stability_opts,
 )
@@ -58,6 +68,11 @@ from app.planner import is_youtube_url as _is_youtube_url
 from app.planner import metadata_without_format_selection as _metadata_without_format_selection
 from app.planner import youtube_player_clients as _youtube_player_clients
 from app.settings import Settings, load_settings
+from app.storage_guard import (
+    ensure_workspace_capacity,
+    required_workspace_bytes,
+    validate_workspace_location,
+)
 from app.temp_files import cleanup_directory_contents, cleanup_job_directory, cleanup_stale_directories
 from app.text_utils import (
     extract_first_url as _extract_first_url,
@@ -74,7 +89,7 @@ from app.text_utils import (
 from app.text_utils import (
     youtube_url_validation,
 )
-from app.url_security import UnsafeUrlError, safe_url_for_log, validate_public_url
+from app.url_security import UnsafeUrlError, safe_error_for_log, safe_url_for_log, validate_public_url
 
 # =========================
 # Telegram bot init
@@ -369,6 +384,7 @@ def _get_video_meta_with_hidden_retries(url: str) -> dict[str, Any]:
                     remote_components=settings.ytdlp_remote_components,
                     cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
                     youtube_player_client=player_client,
+                    generic_impersonate=None,
                 )
                 if not isinstance(meta, dict) or not _has_downloadable_video(meta):
                     raise RuntimeError("extractor returned metadata without a downloadable video")
@@ -393,12 +409,28 @@ def _get_video_meta_with_hidden_retries(url: str) -> dict[str, Any]:
             instagram_fragment_retries=settings.ytdlp_instagram_fragment_retries,
             instagram_socket_timeout=settings.ytdlp_instagram_socket_timeout,
             cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
+            generic_impersonate=None,
         )
         _validate_metadata_urls(meta)
         return meta
-    except Exception:
+    except Exception as primary_error:
         if not _is_instagram_url(url):
-            raise
+            if not settings.ytdlp_generic_impersonate:
+                raise
+            LOGGER.info(
+                "generic metadata retry with browser impersonation error=%s detail=%s",
+                type(primary_error).__name__,
+                safe_error_for_log(primary_error),
+            )
+            meta = _get_video_meta(
+                url,
+                js_runtimes=settings.ytdlp_js_runtimes,
+                remote_components=settings.ytdlp_remote_components,
+                cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
+                generic_impersonate=settings.ytdlp_generic_impersonate,
+            )
+            _validate_metadata_urls(meta)
+            return meta
         LOGGER.debug("Instagram metadata primary attempt failed; using fallback", exc_info=True)
         # Fallback: retry without forced impersonation.
         meta = _get_video_meta(
@@ -410,6 +442,7 @@ def _get_video_meta_with_hidden_retries(url: str) -> dict[str, Any]:
             instagram_fragment_retries=5,
             instagram_socket_timeout=20,
             cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
+            generic_impersonate=None,
         )
         _validate_metadata_urls(meta)
         return meta
@@ -474,13 +507,27 @@ def _download_and_send(job: DownloadJob) -> None:
 
     job_dir = _output_folder() / job_id
     try:
+        _output_folder().mkdir(parents=True, exist_ok=True)
+        ensure_workspace_capacity(_output_folder(), required_workspace_bytes(MAX_SEND_BYTES))
         job_dir.mkdir(parents=True, exist_ok=False)
-    except Exception:
-        LOGGER.exception("job workspace creation failed job_id=%s", job_id)
+    except Exception as error:
+        storage_failure = isinstance(error, DownloadStorageError) or is_enospc_error(error)
+        LOGGER.error(
+            "job workspace creation failed job_id=%s error=%s detail=%s",
+            job_id,
+            type(error).__name__,
+            safe_error_for_log(error),
+        )
+        if storage_failure:
+            _notify_operator_critical(f"Download workspace resource error\njob_id={job_id}")
         _safe_edit(
             chat_id,
             status_message_id,
-            f"{title}\n\nStatus: ❌ Download failed. Please try again.",
+            (
+                f"{title}\n\nStatus: ❌ Download storage is temporarily unavailable. Please try again later."
+                if storage_failure
+                else f"{title}\n\nStatus: ❌ Download failed. Please try again."
+            ),
             reply_markup=None,
             force=True,
         )
@@ -495,19 +542,23 @@ def _download_and_send(job: DownloadJob) -> None:
         plan: VideoFormatCandidate | dict[str, Any],
         tmp_id: str,
         youtube_player_client: str | None = None,
+        instagram_impersonate: bool = True,
+        generic_impersonate: bool = False,
     ) -> dict[str, Any]:
         progress_state: dict[str, Any] = {"pct": 0}
+        byte_limiter = DownloadByteLimiter(MAX_SEND_BYTES)
 
         def progress_hook(data: dict[str, Any]) -> None:
             _check_job(job_id, deadline)
+            # Enforce the byte budget before any presentation-only filtering.
+            # yt-dlp may report component/fragment filenames that do not match
+            # our final output template.
+            byte_limiter.check(data)
             filename = data.get("filename") or data.get("tmpfilename") or ""
             if filename and tmp_id not in os.path.basename(filename):
                 return
             if data.get("status") == "downloading":
                 pct, done_bytes, total_bytes = _calc_download_progress(data, progress_state)
-                hard_total = data.get("total_bytes")
-                if isinstance(hard_total, int) and hard_total > MAX_SEND_BYTES and mode != "audio":
-                    raise RuntimeError("download exceeded the preflight size limit")
                 _safe_edit(
                     chat_id,
                     status_message_id,
@@ -550,10 +601,15 @@ def _download_and_send(job: DownloadJob) -> None:
         _apply_instagram_stability_opts(
             options,
             url,
-            impersonate=settings.ytdlp_instagram_impersonate,
+            impersonate=settings.ytdlp_instagram_impersonate if instagram_impersonate else None,
             retries=settings.ytdlp_instagram_retries,
             fragment_retries=settings.ytdlp_instagram_fragment_retries,
             socket_timeout=settings.ytdlp_instagram_socket_timeout,
+        )
+        _apply_generic_impersonation_opts(
+            options,
+            url,
+            settings.ytdlp_generic_impersonate if generic_impersonate else None,
         )
         if plan.get("merge_output_format"):
             options["merge_output_format"] = str(plan["merge_output_format"])
@@ -567,9 +623,111 @@ def _download_and_send(job: DownloadJob) -> None:
             ]
         return options
 
-    plans: list[VideoFormatCandidate | dict[str, Any]] = (
+    initial_plans: list[VideoFormatCandidate | dict[str, Any]] = (
         ([job.audio_plan] if job.audio_plan else []) if mode == "audio" else list(job.video_candidates)
     )
+
+    def fresh_plans(metadata: dict[str, Any]) -> list[VideoFormatCandidate | dict[str, Any]]:
+        if mode == "audio":
+            audio_plan, _reason = _build_audio_plan_mp3(metadata, MAX_SEND_BYTES)
+            return [audio_plan] if audio_plan else []
+        return list(_build_video_candidates(metadata, MAX_SEND_BYTES))
+
+    def cleanup_attempt_files() -> None:
+        try:
+            cleanup_directory_contents(job_dir, strict=True)
+        except OSError as error:
+            raise_if_terminal_storage_error(error)
+            raise RuntimeError("download attempt cleanup failed") from error
+
+    def try_plans(
+        metadata: dict[str, Any],
+        plans: list[VideoFormatCandidate | dict[str, Any]],
+        *,
+        phase: str,
+        youtube_player_client: str | None = None,
+        concurrent_fragments: int | None = None,
+        instagram_impersonate: bool = True,
+        generic_impersonate: bool = False,
+    ) -> str | None:
+        for index, plan in enumerate(plans, start=1):
+            _check_job(job_id, deadline)
+            cleanup_attempt_files()
+            tmp_id = uuid.uuid4().hex
+            options = build_options(
+                plan,
+                tmp_id,
+                youtube_player_client=youtube_player_client,
+                instagram_impersonate=instagram_impersonate,
+                generic_impersonate=generic_impersonate,
+            )
+            if concurrent_fragments is not None:
+                options["concurrent_fragment_downloads"] = concurrent_fragments
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    info = ydl.process_ie_result(
+                        _metadata_without_format_selection(metadata),
+                        download=True,
+                    )
+                _check_job(job_id, deadline)
+                prefer_ext = ".mp3" if mode == "audio" else None
+                candidate_path = _find_downloaded_file(
+                    info,
+                    os.fspath(job_dir),
+                    tmp_id,
+                    prefer_ext=prefer_ext,
+                )
+                if not candidate_path:
+                    candidate_path = _find_file_by_prefix(
+                        os.fspath(job_dir),
+                        tmp_id,
+                        prefer_ext=prefer_ext,
+                    )
+                if not candidate_path:
+                    raise RuntimeError("downloaded file was not found")
+                remaining = max(1.0, deadline - time.monotonic())
+                validate_media_file(
+                    candidate_path,
+                    mode,
+                    MAX_SEND_BYTES,
+                    timeout_seconds=min(15.0, remaining),
+                )
+                return candidate_path
+            except (JobCancelled, JobTimedOut):
+                raise
+            except Exception as error:
+                raise_if_terminal_storage_error(error)
+                size_limited = is_download_size_error(error)
+                LOGGER.warning(
+                    "download candidate failed job_id=%s phase=%s candidate=%s attempt=%s/%s "
+                    "client=%s reason=%s error=%s detail=%s",
+                    job_id,
+                    phase,
+                    plan.get("format_spec"),
+                    index,
+                    len(plans),
+                    youtube_player_client or "default",
+                    "size-limit" if size_limited else "download-or-validation",
+                    type(error).__name__,
+                    safe_error_for_log(error),
+                )
+                cleanup_attempt_files()
+                _check_job(job_id, deadline)
+        return None
+
+    def extract_fresh_youtube(player_client: str | None) -> dict[str, Any]:
+        metadata = _get_video_meta(
+            url,
+            js_runtimes=settings.ytdlp_js_runtimes,
+            remote_components=settings.ytdlp_remote_components,
+            cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
+            youtube_player_client=player_client,
+            generic_impersonate=settings.ytdlp_generic_impersonate,
+        )
+        if not isinstance(metadata, dict) or not _has_downloadable_video(metadata):
+            raise RuntimeError("extractor returned metadata without a downloadable video")
+        _validate_metadata_urls(metadata)
+        return metadata
 
     try:
         _check_job(job_id, deadline)
@@ -582,134 +740,107 @@ def _download_and_send(job: DownloadJob) -> None:
             force=True,
         )
 
-        for index, plan in enumerate(plans, start=1):
-            cleanup_directory_contents(job_dir)
-            tmp_id = uuid.uuid4().hex
-            options = build_options(plan, tmp_id)
-            info: dict[str, Any]
-            try:
-                _check_job(job_id, deadline)
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    info = ydl.process_ie_result(
-                        _metadata_without_format_selection(job.metadata),
-                        download=True,
-                    )
-            except (JobCancelled, JobTimedOut):
-                raise
-            except Exception:
-                _check_job(job_id, deadline)
-                if _is_youtube_url(url) and mode != "audio":
-                    recovered = False
-                    for player_client in _youtube_player_clients(settings.ytdlp_youtube_player_clients):
-                        _check_job(job_id, deadline)
-                        cleanup_directory_contents(job_dir)
-                        tmp_id = uuid.uuid4().hex
-                        options = build_options(plan, tmp_id, youtube_player_client=player_client)
-                        options["concurrent_fragment_downloads"] = 1
-                        try:
-                            with yt_dlp.YoutubeDL(options) as ydl:
-                                fresh_metadata = ydl.extract_info(url, download=False)
-                            _check_job(job_id, deadline)
-                            if not isinstance(fresh_metadata, dict) or not _has_downloadable_video(fresh_metadata):
-                                raise RuntimeError("extractor returned metadata without a downloadable video")
-                            _validate_metadata_urls(fresh_metadata)
-                            fresh_candidates = _build_video_candidates(fresh_metadata, MAX_SEND_BYTES)
-                            if not any(
-                                candidate.format_spec == plan.get("format_spec") for candidate in fresh_candidates
-                            ):
-                                raise RuntimeError("fresh metadata did not prove the prechecked format")
-                            with yt_dlp.YoutubeDL(options) as ydl:
-                                info = ydl.process_ie_result(
-                                    _metadata_without_format_selection(fresh_metadata),
-                                    download=True,
-                                )
-                            _check_job(job_id, deadline)
-                            recovered = True
-                            break
-                        except (JobCancelled, JobTimedOut):
-                            raise
-                        except Exception:
-                            LOGGER.warning(
-                                "YouTube fresh extraction candidate failed job_id=%s candidate=%s client=%s",
-                                job_id,
-                                plan.get("format_spec"),
-                                player_client or "default",
-                                exc_info=True,
-                            )
-                            _check_job(job_id, deadline)
-                    if not recovered:
-                        cleanup_directory_contents(job_dir)
-                        continue
-                elif not _is_instagram_url(url):
-                    LOGGER.warning(
-                        "download candidate failed job_id=%s stage=download candidate=%s attempt=%s/%s",
-                        job_id,
-                        plan.get("format_spec"),
-                        index,
-                        len(plans),
-                        exc_info=True,
-                    )
-                    cleanup_directory_contents(job_dir)
-                    continue
-                else:
-                    LOGGER.info(
-                        "Instagram fresh extraction retry job_id=%s stage=download candidate=%s",
-                        job_id,
-                        plan.get("format_spec"),
-                        exc_info=True,
-                    )
-                    cleanup_directory_contents(job_dir)
-                    tmp_id = uuid.uuid4().hex
-                    options = build_options(plan, tmp_id)
-                    options.pop("impersonate", None)
-                    options["concurrent_fragment_downloads"] = 1
-                    try:
-                        with yt_dlp.YoutubeDL(options) as ydl:
-                            info = ydl.extract_info(url, download=True)
-                    except (JobCancelled, JobTimedOut):
-                        raise
-                    except Exception:
-                        LOGGER.warning(
-                            "Instagram candidate failed after fresh extraction job_id=%s candidate=%s attempt=%s/%s",
-                            job_id,
-                            plan.get("format_spec"),
-                            index,
-                            len(plans),
-                            exc_info=True,
-                        )
-                        cleanup_directory_contents(job_dir)
-                        continue
+        file_path = try_plans(job.metadata, initial_plans, phase="initial")
 
-            try:
+        if file_path is None and _is_youtube_url(url):
+            for player_client in _youtube_player_clients(settings.ytdlp_youtube_player_clients):
                 _check_job(job_id, deadline)
-                prefer_ext = ".mp3" if mode == "audio" else None
-                file_path = _find_downloaded_file(info, os.fspath(job_dir), tmp_id, prefer_ext=prefer_ext)
-                if not file_path:
-                    file_path = _find_file_by_prefix(os.fspath(job_dir), tmp_id, prefer_ext=prefer_ext)
-                if not file_path:
-                    raise RuntimeError("downloaded file was not found")
-                remaining = max(1.0, deadline - time.monotonic())
-                validate_media_file(
-                    file_path,
-                    mode,
-                    MAX_SEND_BYTES,
-                    timeout_seconds=min(15.0, remaining),
+                cleanup_attempt_files()
+                try:
+                    fresh_metadata = extract_fresh_youtube(player_client)
+                    candidate_plans = fresh_plans(fresh_metadata)
+                    if not candidate_plans:
+                        raise RuntimeError("fresh metadata has no eligible download candidates")
+                except (JobCancelled, JobTimedOut):
+                    raise
+                except Exception as error:
+                    raise_if_terminal_storage_error(error)
+                    LOGGER.warning(
+                        "YouTube fallback extraction failed job_id=%s client=%s error=%s detail=%s",
+                        job_id,
+                        player_client or "default",
+                        type(error).__name__,
+                        safe_error_for_log(error),
+                    )
+                    continue
+                file_path = try_plans(
+                    fresh_metadata,
+                    candidate_plans,
+                    phase="fresh",
+                    youtube_player_client=player_client,
+                    concurrent_fragments=1,
                 )
-                break
+                if file_path is not None:
+                    break
+
+        if file_path is None and _is_instagram_url(url):
+            cleanup_attempt_files()
+            try:
+                fresh_metadata = _get_video_meta(
+                    url,
+                    js_runtimes=settings.ytdlp_js_runtimes,
+                    remote_components=settings.ytdlp_remote_components,
+                    instagram_impersonate=None,
+                    instagram_retries=5,
+                    instagram_fragment_retries=5,
+                    instagram_socket_timeout=20,
+                    cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
+                    generic_impersonate=None,
+                )
+                _validate_metadata_urls(fresh_metadata)
+                file_path = try_plans(
+                    fresh_metadata,
+                    fresh_plans(fresh_metadata),
+                    phase="fresh",
+                    concurrent_fragments=1,
+                    instagram_impersonate=False,
+                )
             except (JobCancelled, JobTimedOut):
                 raise
-            except Exception:
+            except Exception as error:
+                raise_if_terminal_storage_error(error)
                 LOGGER.warning(
-                    "download candidate rejected job_id=%s stage=validate candidate=%s attempt=%s/%s",
+                    "Instagram fallback extraction failed job_id=%s error=%s detail=%s",
                     job_id,
-                    plan.get("format_spec"),
-                    index,
-                    len(plans),
-                    exc_info=True,
+                    type(error).__name__,
+                    safe_error_for_log(error),
                 )
-                file_path = None
-                cleanup_directory_contents(job_dir)
-        else:
+
+        if (
+            file_path is None
+            and not _is_youtube_url(url)
+            and not _is_instagram_url(url)
+            and settings.ytdlp_generic_impersonate
+        ):
+            cleanup_attempt_files()
+            try:
+                fresh_metadata = _get_video_meta(
+                    url,
+                    js_runtimes=settings.ytdlp_js_runtimes,
+                    remote_components=settings.ytdlp_remote_components,
+                    cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
+                    generic_impersonate=settings.ytdlp_generic_impersonate,
+                )
+                _validate_metadata_urls(fresh_metadata)
+                file_path = try_plans(
+                    fresh_metadata,
+                    fresh_plans(fresh_metadata),
+                    phase="impersonated",
+                    concurrent_fragments=1,
+                    generic_impersonate=True,
+                )
+            except (JobCancelled, JobTimedOut):
+                raise
+            except Exception as error:
+                raise_if_terminal_storage_error(error)
+                LOGGER.warning(
+                    "generic impersonation fallback failed job_id=%s error=%s detail=%s",
+                    job_id,
+                    type(error).__name__,
+                    safe_error_for_log(error),
+                )
+
+        if file_path is None:
             raise RuntimeError("all prechecked download candidates failed")
 
         _check_job(job_id, deadline)
@@ -781,6 +912,20 @@ def _download_and_send(job: DownloadJob) -> None:
             chat_id,
             status_message_id,
             f"{title}\n\nStatus: ❌ Job timed out. Please try again.",
+            reply_markup=None,
+            force=True,
+        )
+    except DownloadStorageError as error:
+        LOGGER.error(
+            "job stopped by terminal storage error job_id=%s detail=%s",
+            job_id,
+            safe_error_for_log(error),
+        )
+        _notify_operator_critical(f"Download workspace resource error\njob_id={job_id}")
+        _safe_edit(
+            chat_id,
+            status_message_id,
+            f"{title}\n\nStatus: ❌ Download storage is temporarily unavailable. Please try again later.",
             reply_markup=None,
             force=True,
         )
@@ -894,24 +1039,22 @@ def _send_choice_ui(message, url: str) -> None:
     title = (meta.get("title") or "Video").strip()
     title = _strip_hashtags(title) or "Video"
 
-    # Build a best-first list. Every retained candidate has a proven size.
-    proven_candidates = _build_video_candidates(meta, 2**63 - 1)
-    video_candidates = [candidate for candidate in proven_candidates if candidate.estimated_size <= MAX_SEND_BYTES]
+    # Approximate fragmented sizes carry explicit headroom; the runtime byte
+    # limiter remains authoritative for every retained candidate.
+    estimated_candidates = _build_video_candidates(meta, 2**63 - 1)
+    video_candidates = [candidate for candidate in estimated_candidates if candidate.estimated_size <= MAX_SEND_BYTES]
     video_plan = video_candidates[0] if video_candidates else None
-    display_plan = video_plan or (proven_candidates[0] if proven_candidates else None)
+    display_plan = video_plan or (estimated_candidates[0] if estimated_candidates else None)
 
     audio_plan, audio_reason = _build_audio_plan_mp3(meta, MAX_SEND_BYTES)
 
     _safe_delete(message.chat.id, processing_msg.message_id)
 
-    # Decide availability for VIDEO/DOC:
-    # We allow only if size is confident and <= limit.
     video_size = display_plan.get("estimated_size") if display_plan else None
-    video_conf = bool(display_plan and display_plan.estimated_confident and display_plan.estimated_size > 0)
-    video_ok = bool(video_conf and isinstance(video_size, int) and video_size <= MAX_SEND_BYTES)
+    video_size_known = bool(display_plan and display_plan.estimated_size > 0)
+    video_ok = bool(video_size_known and isinstance(video_size, int) and video_size <= MAX_SEND_BYTES)
 
-    # If video is confidently too big -> tell and do not offer Video/Document.
-    if video_conf and isinstance(video_size, int) and video_size > MAX_SEND_BYTES:
+    if video_size_known and isinstance(video_size, int) and video_size > MAX_SEND_BYTES:
         msg = (
             f"{title}\n\n"
             f"This video is too large for Telegram bots.\n"
@@ -952,7 +1095,8 @@ def _send_choice_ui(message, url: str) -> None:
         _safe_send_message(message.chat.id, msg, reply_to_message_id=message.message_id)
         return
 
-    # If we cannot confidently determine size -> do NOT download video/doc (policy to avoid wasting time/data)
+    # Unknown-size formats are not offered. Approximate fragmented formats are
+    # allowed only after adding headroom and remain protected by the hard cap.
     if not video_ok:
         msg = (
             f"{title}\n\n"
@@ -1016,8 +1160,9 @@ def _send_choice_ui(message, url: str) -> None:
     if audio_plan:
         kb.add(types.InlineKeyboardButton("Download as Audio (MP3)", callback_data=f"dl|audio|{request_id}"))
 
+    size_kind = "Estimated" if video_plan.estimated_confident else "Approximate"
     info_lines = [
-        f"Estimated size: {_fmt_bytes(int(video_size))} (limit {_fmt_bytes(MAX_SEND_BYTES)})",
+        f"{size_kind} size: {_fmt_bytes(int(video_size))} (limit {_fmt_bytes(MAX_SEND_BYTES)})",
         f"Selected: {video_plan.get('quality_label', 'mp4')}",
     ]
     if audio_plan:
@@ -1286,8 +1431,13 @@ def register_handlers(instance: telebot.TeleBot) -> None:
 
 
 def _preflight(settings: Settings, instance: telebot.TeleBot) -> None:
+    validate_workspace_location(settings.output_dir)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     settings.logs_dir.mkdir(parents=True, exist_ok=True)
+    ensure_workspace_capacity(
+        settings.output_dir,
+        required_workspace_bytes(settings.max_filesize, settings.workers),
+    )
     probe = settings.output_dir / ".write-test"
     probe.write_text("ok", encoding="utf-8")
     probe.unlink()

@@ -18,6 +18,7 @@ def _format(
     height: int = 720,
     fps: int = 30,
     tbr: int = 1_000,
+    **extra,
 ) -> dict:
     result = {
         "format_id": format_id,
@@ -31,6 +32,7 @@ def _format(
     }
     if filesize is not None:
         result["filesize"] = filesize
+    result.update(extra)
     return result
 
 
@@ -228,6 +230,52 @@ def test_candidate_larger_than_limit_is_not_eligible() -> None:
     }
 
     assert planner.build_video_candidates(meta, LIMIT) == []
+
+
+def test_fragmented_filesize_approx_is_buffered_and_not_marked_exact() -> None:
+    reported = 20_000_000
+    meta = {
+        "formats": [
+            _format(
+                "hls",
+                url="https://cdn.example/playlist.m3u8",
+                vcodec="avc1.64001f",
+                acodec="mp4a.40.2",
+                filesize=None,
+                filesize_approx=reported,
+                protocol="m3u8_native",
+            )
+        ]
+    }
+
+    candidate = planner.build_video_candidates(meta, LIMIT)[0]
+
+    assert candidate.estimated_size > reported
+    assert candidate.estimated_confident is False
+    assert candidate.size_source == "fragmented-approximate"
+
+
+def test_complete_fragment_sizes_are_treated_as_exact() -> None:
+    meta = {
+        "formats": [
+            _format(
+                "hls",
+                url="https://cdn.example/playlist.m3u8",
+                vcodec="avc1.64001f",
+                acodec="mp4a.40.2",
+                filesize=None,
+                filesize_approx=1,
+                protocol="m3u8_native",
+                fragments=[{"filesize": 10_000_000}, {"filesize": 11_000_000}],
+            )
+        ]
+    }
+
+    candidate = planner.build_video_candidates(meta, LIMIT)[0]
+
+    assert candidate.estimated_size == 21_000_000
+    assert candidate.estimated_confident is True
+    assert candidate.size_source == "fragments"
 
 
 def test_stale_metadata_selection_is_removed_without_mutating_original() -> None:

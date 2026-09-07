@@ -31,6 +31,7 @@ def test_docker_hardening_and_no_runtime_pip() -> None:
     assert "YTDLP_CACHEBUST" in dockerfile
     assert "read_only: true" in compose
     assert "no-new-privileges:true" in compose
+    assert "OUTPUT_FOLDER: /app/data/downloads" in compose
     assert "pip install" not in updater
     assert "--pull" not in updater
     assert '"$health" == "healthy"' in (ROOT / "scripts/lib-production.sh").read_text(encoding="utf-8")
@@ -59,6 +60,7 @@ def test_installer_preserves_existing_environment_and_uses_main() -> None:
     assert 'BRANCH="main"' in installer
     assert 'if [[ ! -f "$env_file" ]]' in installer
     assert 'chmod 600 "$env_file"' in installer
+    assert "config core.fileMode false" in installer
     assert "pull --ff-only" in installer
     assert "status --porcelain --untracked-files=no" in installer
     assert "write_docker_files" not in installer

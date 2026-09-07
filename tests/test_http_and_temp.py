@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import main
+from app.download_utils import find_file_by_prefix
 from app.http_utils import telegram_upload_session
 from app.temp_files import cleanup_job_directory, cleanup_stale_directories
 
@@ -40,3 +41,12 @@ def test_temporary_file_cleanup(tmp_path) -> None:
     os.utime(stale, (time.time() - 1000, time.time() - 1000))
     assert cleanup_stale_directories(tmp_path, 100) == 1
     assert not stale.exists()
+
+
+def test_download_discovery_ignores_partial_and_component_files(tmp_path) -> None:
+    (tmp_path / "item.part").write_bytes(b"partial")
+    (tmp_path / "item.f137.mp4").write_bytes(b"video component")
+    final = tmp_path / "item.mp4"
+    final.write_bytes(b"final")
+
+    assert find_file_by_prefix(os.fspath(tmp_path), "item") == os.fspath(final)

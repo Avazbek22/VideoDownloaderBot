@@ -8,11 +8,11 @@ from pathlib import Path
 
 
 class RedactingFormatter(logging.Formatter):
-    _url_query = re.compile(r"(https?://[^\s?]+)\?[^\s]+", re.IGNORECASE)
+    _url = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
     _bot_token = re.compile(r"(?<![A-Za-z0-9_-])\d{5,}:[A-Za-z0-9_-]{20,}")
 
     def format(self, record: logging.LogRecord) -> str:
-        message = self._url_query.sub(r"\1?<redacted>", super().format(record))
+        message = self._url.sub("<url-redacted>", super().format(record))
         return self._bot_token.sub("<bot-token-redacted>", message)
 
 

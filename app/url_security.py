@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 import socket
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -79,7 +80,16 @@ def safe_url_for_log(url: str) -> str:
     try:
         parts = urlsplit(url)
         host = parts.hostname or "invalid"
-        return urlunsplit((parts.scheme, host, parts.path, "", ""))[:512]
+        return urlunsplit((parts.scheme, host, "", "", ""))[:256]
     except Exception:
         LOGGER.debug("failed to sanitize URL for logging", exc_info=True)
         return "<invalid-url>"
+
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+
+def safe_error_for_log(error: BaseException) -> str:
+    """Return a bounded one-line error without source paths, queries, or fragments."""
+    summary = " ".join(str(error).split())
+    return _URL_IN_TEXT.sub("<url-redacted>", summary)[:512]

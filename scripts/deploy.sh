@@ -44,12 +44,14 @@ rollback() {
     if [[ "$units_changed" == "1" ]]; then
       restore_systemd_units || log "failed to restore previous systemd units"
     fi
-    if [[ "$replacement_attempted" == "1" ]]; then
+    if [[ "$replacement_attempted" == "1" && "$image_restored" == "1" ]]; then
       compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" \
         up -d --no-deps --force-recreate "$SERVICE_KEY" || log "failed to recreate rollback container"
-      if [[ "$image_restored" == "1" ]] && ! wait_until_stable "$previous_image_id"; then
+      if ! wait_until_stable "$previous_image_id"; then
         log "rollback container did not return to a stable healthy state"
       fi
+    elif [[ "$replacement_attempted" == "1" ]]; then
+      log "rollback container was not recreated because the previous image tag could not be restored"
     fi
     cleanup_candidate_image
     printf '%s\n' "$target_commit" >"$FAILED_SHA_FILE"
@@ -64,6 +66,45 @@ cleanup_candidate_image() {
   [[ "$candidate_image_id" != "$current_image_id" ]] || return 0
   docker image rm "$candidate_image_id" >/dev/null 2>&1 \
     || log "candidate image cleanup skipped id=$candidate_image_id"
+}
+
+ensure_current_image_tag() {
+  local tagged_image_id
+  tagged_image_id="$(docker image inspect "$IMAGE_NAME" --format '{{.Id}}' 2>/dev/null || true)"
+  local -a container_ids=()
+  local container_id details running_image_id running health restarts project service
+  mapfile -t container_ids < <(
+    compose -p "$COMPOSE_PROJECT" -f "$ROOT_DIR/docker-compose.yml" ps -q "$SERVICE_KEY" |
+      sed '/^[[:space:]]*$/d'
+  )
+  if [[ "${#container_ids[@]}" -ne 1 ]]; then
+    log "cannot recover $IMAGE_NAME: expected one compose container, found ${#container_ids[@]}"
+    return 1
+  fi
+
+  container_id="${container_ids[0]}"
+  details="$(docker inspect --format \
+    '{{.Image}}|{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.RestartCount}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' \
+    "$container_id" 2>/dev/null || true)"
+  IFS='|' read -r running_image_id running health restarts project service <<<"$details"
+  if [[ -z "$running_image_id" || "$running" != "true" || "$health" != "healthy" \
+      || "$restarts" != "0" || "$project" != "$COMPOSE_PROJECT" || "$service" != "$SERVICE_KEY" ]]; then
+    log "cannot recover $IMAGE_NAME: compose container identity or health check failed"
+    return 1
+  fi
+  if ! docker image inspect "$running_image_id" >/dev/null 2>&1; then
+    log "cannot recover $IMAGE_NAME: running image is unavailable"
+    return 1
+  fi
+  previous_image_id="$running_image_id"
+  if [[ "$tagged_image_id" != "$running_image_id" ]]; then
+    docker image tag "$running_image_id" "$IMAGE_NAME"
+    if [[ -z "$tagged_image_id" ]]; then
+      log "restored missing image tag $IMAGE_NAME from the healthy compose container"
+    else
+      log "corrected stale image tag $IMAGE_NAME from the healthy compose container"
+    fi
+  fi
 }
 
 unit_names=(
@@ -126,6 +167,9 @@ cleanup_units_backup() {
 validate_checkout() {
   [[ -d "$ROOT_DIR/.git" ]] || { log "not a Git checkout: $ROOT_DIR"; return 1; }
   [[ -f "$ROOT_DIR/.env" ]] || { log "missing $ROOT_DIR/.env"; return 1; }
+  # Host execution modes are intentionally managed by install.sh/systemd.
+  # Ignore mode-only differences while preserving all content checks.
+  git -C "$ROOT_DIR" config core.fileMode false
   if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
     log "tracked local changes detected; deployment refused"
     return 1
@@ -177,8 +221,7 @@ main() {
     return 0
   fi
 
-  previous_image_id="$(docker image inspect "$IMAGE_NAME" --format '{{.Id}}' 2>/dev/null || true)"
-  [[ -n "$previous_image_id" ]] || { log "current image is unavailable"; return 1; }
+  ensure_current_image_tag
   docker image tag "$IMAGE_NAME" "$ROLLBACK_IMAGE"
   deployment_started=1
   trap rollback ERR INT TERM

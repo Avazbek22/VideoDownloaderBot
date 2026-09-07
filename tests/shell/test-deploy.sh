@@ -26,14 +26,13 @@ SH
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'docker %s\n' "$*" >>"$FAKE_COMMAND_LOG"
-if [[ "$*" == *" run "* && "${FAKE_FAIL_SMOKE:-0}" == "1" ]]; then exit 1; fi
 
 image_id() {
-  if [[ "$1" == *rollback ]]; then
-    cat "$FAKE_STATE_DIR/rollback-image-id"
-  else
-    cat "$FAKE_STATE_DIR/main-image-id"
-  fi
+  case "$1" in
+    *rollback) cat "$FAKE_STATE_DIR/rollback-image-id" ;;
+    videodownloaderbot:local) cat "$FAKE_STATE_DIR/main-image-id" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
 }
 
 if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
@@ -41,6 +40,8 @@ if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
     image_id "$3"
   elif [[ "$3" == *rollback ]]; then
     [[ -s "$FAKE_STATE_DIR/rollback-image-id" ]]
+  elif [[ "$3" != "videodownloaderbot:local" ]]; then
+    exit 0
   else
     [[ -s "$FAKE_STATE_DIR/main-image-id" ]]
   fi
@@ -69,6 +70,11 @@ case "$*" in
     printf '%s\n' candidate-image >"$FAKE_STATE_DIR/main-image-id"
     : >"$FAKE_STATE_DIR/image-built"
     ;;
+  *" run "*" sh -ec "*)
+    if [[ "${FAKE_FAIL_SMOKE:-0}" == "1" ]]; then
+      exit 1
+    fi
+    ;;
   *" run "*"python -m yt_dlp --version"*)
     if [[ "${FAKE_SAME_VERSION:-0}" == "1" || ! -f "$FAKE_STATE_DIR/image-built" ]]; then
       echo 2026.01.01
@@ -76,8 +82,20 @@ case "$*" in
       echo 2026.02.01
     fi
     ;;
-  *" run "*) [[ "${FAKE_FAIL_SMOKE:-0}" != "1" ]] ;;
-  *" ps -q "*) echo fake-container ;;
+  *" run "*) ;;
+  *" ps -q "*)
+    if [[ "${FAKE_MULTIPLE_CONTAINERS:-0}" == "1" ]]; then
+      printf '%s\n' fake-container another-container
+    else
+      echo fake-container
+    fi
+    ;;
+  "inspect --format "*"com.docker.compose.project"*" fake-container")
+    if [[ "${FAKE_BAD_RECOVERY_HEALTH:-0}" == "1" ]]; then health=unhealthy; else health=healthy; fi
+    if [[ "${FAKE_WRONG_LABELS:-0}" == "1" ]]; then project=wrong; else project=videodownloaderbot; fi
+    printf '%s|true|%s|0|%s|videodownloaderbot\n' \
+      "$(cat "$FAKE_STATE_DIR/running-image-id")" "$health" "$project"
+    ;;
   "inspect --format {{.State.Running}} fake-container") echo true ;;
   "inspect --format {{.RestartCount}} fake-container") echo 0 ;;
   "inspect --format {{.Image}} fake-container") cat "$FAKE_STATE_DIR/running-image-id" ;;
@@ -159,6 +177,15 @@ run_script "$success" "$REPOSITORY_ROOT/scripts/deploy.sh"
 grep -q 'deployment successful commit=new-commit' "$success/logs/deploy-"*.log
 [[ "$(grep -c '{{.Image}}' "$success/commands.log")" -ge 5 ]]
 
+deploy_missing_tag="$TEST_ROOT/deploy-missing-tag"
+prepare_case "$deploy_missing_tag"
+: >"$deploy_missing_tag/main-image-id"
+run_script "$deploy_missing_tag" "$REPOSITORY_ROOT/scripts/deploy.sh"
+[[ "$(<"$deploy_missing_tag/head")" == new-commit ]]
+[[ "$(<"$deploy_missing_tag/main-image-id")" == candidate-image ]]
+[[ "$(<"$deploy_missing_tag/running-image-id")" == candidate-image ]]
+grep -q 'image tag old-image videodownloaderbot:local' "$deploy_missing_tag/commands.log"
+
 wrong_image="$TEST_ROOT/deploy-wrong-image"
 prepare_case "$wrong_image"
 if run_script "$wrong_image" "$REPOSITORY_ROOT/scripts/deploy.sh" FAKE_KEEP_OLD_IMAGE=1; then exit 1; fi
@@ -222,6 +249,25 @@ prepare_case "$updater"
 if run_script "$updater" "$REPOSITORY_ROOT/scripts/update-ytdlp.sh" FAKE_FAIL_BUILD=1; then exit 1; fi
 grep -q 'yt-dlp update failed; restoring previous image' "$updater/logs/updater-"*.log
 grep -q 'image tag videodownloaderbot:rollback videodownloaderbot:local' "$updater/commands.log"
+[[ "$(<"$updater/running-image-id")" == old-image ]]
+
+updater_smoke_failed="$TEST_ROOT/updater-smoke-failed"
+prepare_case "$updater_smoke_failed"
+if run_script "$updater_smoke_failed" "$REPOSITORY_ROOT/scripts/update-ytdlp.sh" \
+  FAKE_FAIL_SMOKE=1; then
+  exit 1
+fi
+[[ "$(<"$updater_smoke_failed/main-image-id")" == old-image ]]
+[[ "$(<"$updater_smoke_failed/running-image-id")" == old-image ]]
+if grep -q ' up -d ' "$updater_smoke_failed/commands.log"; then
+  echo "failed updater smoke test replaced the running container" >&2
+  exit 1
+fi
+if ! grep -q 'image rm candidate-image' "$updater_smoke_failed/commands.log"; then
+  echo "failed updater candidate was not removed" >&2
+  cat "$updater_smoke_failed/commands.log" >&2
+  exit 1
+fi
 
 updater_unhealthy="$TEST_ROOT/updater-unhealthy"
 prepare_case "$updater_unhealthy"
@@ -246,6 +292,45 @@ fi
 grep -q 'yt-dlp already up to date' "$updater_same/logs/updater-"*.log
 grep -q 'image tag videodownloaderbot:rollback videodownloaderbot:local' "$updater_same/commands.log"
 grep -q 'image rm candidate-image' "$updater_same/commands.log"
+
+updater_missing_tag="$TEST_ROOT/updater-missing-tag"
+prepare_case "$updater_missing_tag"
+: >"$updater_missing_tag/main-image-id"
+run_script "$updater_missing_tag" "$REPOSITORY_ROOT/scripts/update-ytdlp.sh"
+[[ "$(<"$updater_missing_tag/main-image-id")" == candidate-image ]]
+[[ "$(<"$updater_missing_tag/running-image-id")" == candidate-image ]]
+grep -q 'image tag old-image videodownloaderbot:local' "$updater_missing_tag/commands.log"
+grep -q 'restored missing image tag videodownloaderbot:local' "$updater_missing_tag/logs/updater-"*.log
+
+updater_stale_tag="$TEST_ROOT/updater-stale-tag"
+prepare_case "$updater_stale_tag"
+printf '%s\n' stale-image >"$updater_stale_tag/main-image-id"
+run_script "$updater_stale_tag" "$REPOSITORY_ROOT/scripts/update-ytdlp.sh"
+grep -q 'image tag old-image videodownloaderbot:local' "$updater_stale_tag/commands.log"
+grep -q 'corrected stale image tag videodownloaderbot:local' "$updater_stale_tag/logs/updater-"*.log
+[[ "$(<"$updater_stale_tag/running-image-id")" == candidate-image ]]
+
+updater_untrusted_container="$TEST_ROOT/updater-untrusted-container"
+prepare_case "$updater_untrusted_container"
+: >"$updater_untrusted_container/main-image-id"
+if run_script "$updater_untrusted_container" "$REPOSITORY_ROOT/scripts/update-ytdlp.sh" \
+  FAKE_WRONG_LABELS=1; then
+  echo "updater recovered an image from a container with incorrect compose labels" >&2
+  exit 1
+fi
+if grep -q ' build ' "$updater_untrusted_container/commands.log"; then
+  echo "updater built an image after rejecting the running container" >&2
+  exit 1
+fi
+
+updater_multiple_containers="$TEST_ROOT/updater-multiple-containers"
+prepare_case "$updater_multiple_containers"
+: >"$updater_multiple_containers/main-image-id"
+if run_script "$updater_multiple_containers" "$REPOSITORY_ROOT/scripts/update-ytdlp.sh" \
+  FAKE_MULTIPLE_CONTAINERS=1; then
+  echo "updater recovered an image with multiple compose containers present" >&2
+  exit 1
+fi
 
 installer="$TEST_ROOT/installer-rollback"
 prepare_case "$installer"
