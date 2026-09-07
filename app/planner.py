@@ -473,9 +473,7 @@ def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[Video
                 quality_label=f"{height}p" if height else "mp4",
                 compatibility=2,
                 direct_urls=_direct_urls(video, audio),
-                size_source=(
-                    video_source if video_source == audio_source else f"{video_source}+{audio_source}"
-                ),
+                size_source=(video_source if video_source == audio_source else f"{video_source}+{audio_source}"),
             )
             raw.append(((2, height, fps, bitrate), candidate))
 

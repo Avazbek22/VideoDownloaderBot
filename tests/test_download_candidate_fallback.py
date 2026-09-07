@@ -370,9 +370,7 @@ def test_downloaded_bytes_hard_cap_aborts_attempt_and_cleans_partial_files(tmp_p
     monkeypatch.setattr(main.yt_dlp, "YoutubeDL", FakeYDL)
     monkeypatch.setattr(main, "validate_media_file", lambda *_args, **_kwargs: None)
 
-    main._download_and_send(
-        _job("https://example.com/video", (_candidate("oversized-hls"), _candidate("fits")))
-    )
+    main._download_and_send(_job("https://example.com/video", (_candidate("oversized-hls"), _candidate("fits"))))
 
     assert formats_seen == ["oversized-hls", "fits"]
     assert contents_before_attempt == [[], []]
