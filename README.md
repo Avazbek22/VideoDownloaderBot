@@ -65,6 +65,7 @@ Most “download bots” are either public (unstable / rate-limited / banned), o
 
 * ranks Telegram-compatible H.264 MP4 by compatibility and quality
 * supports both progressive MP4 and MP4 video + M4A audio without automatically preferring progressive
+* for YouTube, prefers the uploader's original audio over regional automatic dubs, including after fallback retries
 * handles deduplicated Instagram direct MP4 candidates whose codec metadata is missing
 
 4. Bot tries to **prove** final size is ≤ 50 MB:
@@ -79,6 +80,7 @@ Most “download bots” are either public (unstable / rate-limited / banned), o
 6. For **Audio (MP3)**:
 
 * uses duration to pick the **highest MP3 bitrate** that will safely fit (with headroom)
+* for YouTube, extracts the original audio track when YouTube exposes it; an automatic dub is only a fallback
 
 7. During download/upload:
 

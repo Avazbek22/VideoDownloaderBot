@@ -18,6 +18,7 @@ FRAGMENTED_SIZE_FACTOR = 1.25
 FRAGMENTED_SIZE_HEADROOM_BYTES = 1024 * 1024
 LOGGER = logging.getLogger(__name__)
 H264_PREFIXES = ("avc1", "avc3", "h264")
+ORIGINAL_AUDIO_LANGUAGE_FIELD = "_vdb_original_audio_language"
 FORMAT_SELECTION_FIELDS = frozenset(
     {
         "requested_formats",
@@ -39,6 +40,7 @@ FORMAT_SELECTION_FIELDS = frozenset(
         "abr",
         "protocol",
         "container",
+        ORIGINAL_AUDIO_LANGUAGE_FIELD,
     }
 )
 
@@ -80,9 +82,15 @@ def apply_youtube_runtime_opts(
     js_runtimes: str | None,
     remote_components: str | None,
     player_client: str | None = None,
+    youtube_language: str | None = None,
 ) -> dict[str, Any]:
     if not is_youtube_url(url):
         return opts
+    # YouTube may expose an automatic dub as the regional/account default.
+    # Put yt-dlp's language preference ahead of bitrate and codec whenever a
+    # generic selector such as `bestaudio` still has to make the final choice.
+    opts["format_sort"] = ["lang"]
+    opts["format_sort_force"] = True
     if js_runtimes:
         parsed: dict[str, dict[str, str]] = {}
         for raw in str(js_runtimes).split(","):
@@ -103,8 +111,17 @@ def apply_youtube_runtime_opts(
         comps = [x.strip() for x in str(remote_components).split(",") if x.strip()]
         if comps:
             opts["remote_components"] = comps
+    youtube_args: dict[str, list[str]] = {}
     if player_client:
-        opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
+        youtube_args["player_client"] = [player_client]
+    if request_language := youtube_request_language(youtube_language):
+        youtube_args["lang"] = [request_language]
+    if youtube_args:
+        extractor_args = dict(opts.get("extractor_args") or {})
+        existing_youtube_args = dict(extractor_args.get("youtube") or {})
+        existing_youtube_args.update(youtube_args)
+        extractor_args["youtube"] = existing_youtube_args
+        opts["extractor_args"] = extractor_args
     return opts
 
 
@@ -246,6 +263,7 @@ def get_video_meta(
     instagram_socket_timeout: int | None = None,
     cookies_file: str | None = None,
     youtube_player_client: str | None = None,
+    youtube_language: str | None = None,
     generic_impersonate: str | None = None,
 ) -> dict[str, Any]:
     ydl_opts: dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
@@ -257,6 +275,7 @@ def get_video_meta(
         js_runtimes,
         remote_components,
         player_client=youtube_player_client,
+        youtube_language=youtube_language,
     )
     ydl_opts = apply_instagram_stability_opts(
         ydl_opts,
@@ -317,6 +336,160 @@ def metadata_without_format_selection(meta: dict[str, Any]) -> dict[str, Any]:
 
 def _positive_number(value: Any) -> float:
     return float(value) if isinstance(value, (int, float)) and value > 0 else 0.0
+
+
+def _number(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
+def _format_has_audio(fmt: dict[str, Any]) -> bool:
+    audio_codec = str(fmt.get("acodec") or "").strip().lower()
+    if audio_codec:
+        return audio_codec != "none"
+    return str(fmt.get("ext") or "").lower() in {"aac", "m4a", "mp3", "mp4", "ogg", "opus", "webm"} and bool(
+        fmt.get("url")
+    )
+
+
+def _normalized_language_code(value: Any) -> str:
+    return str(value or "").strip().replace("_", "-").casefold()
+
+
+def same_language(left: Any, right: Any) -> bool:
+    left_code = _normalized_language_code(left)
+    right_code = _normalized_language_code(right)
+    if not left_code or not right_code:
+        return False
+    if left_code == right_code:
+        return True
+    left_parts = left_code.split("-")
+    right_parts = right_code.split("-")
+    return left_parts[0] == right_parts[0] and (len(left_parts) == 1 or len(right_parts) == 1)
+
+
+def _audio_role_score(fmt: dict[str, Any], original_language: str | None = None) -> int:
+    """Rank source audio above unlabelled, dubbed, and descriptive tracks."""
+    note = " ".join(str(fmt.get(key) or "") for key in ("format_note", "format")).casefold()
+    preference = _number(fmt.get("language_preference"))
+
+    # yt-dlp normally assigns -10 to descriptive audio. A positive preference
+    # alone is not authoritative: YouTube can elevate a regional default dub.
+    if preference <= -10 or "descriptive" in note or "audio description" in note:
+        return 0
+    if "dubbed" in note or "auto-dub" in note or "autodub" in note:
+        return 1
+    language = _normalized_language_code(fmt.get("language"))
+    if original_language and language:
+        return 3 if same_language(language, original_language) else 2
+    if preference >= 10 or "original" in note:
+        return 3
+    # Preserve quality-based ordering for sites that do not expose roles.
+    return 2
+
+
+def original_audio_language_candidates(meta: dict[str, Any]) -> list[str]:
+    remembered = _normalized_language_code(meta.get(ORIGINAL_AUDIO_LANGUAGE_FIELD))
+    if remembered:
+        return [remembered]
+
+    # yt-dlp's `*-orig` caption marker is derived from YouTube's source
+    # captions and is more reliable than a regional audio preference.
+    candidates: list[str] = []
+
+    def add(language: Any) -> None:
+        normalized = _normalized_language_code(language)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    automatic_captions = meta.get("automatic_captions")
+    if isinstance(automatic_captions, dict):
+        for language, tracks in automatic_captions.items():
+            normalized = _normalized_language_code(language)
+            if normalized.endswith("-orig"):
+                add(normalized.removesuffix("-orig"))
+                continue
+            if not isinstance(tracks, list):
+                continue
+            if any(
+                "original" in str(track.get("name") or "").casefold()
+                for track in tracks
+                if isinstance(track, dict)
+            ):
+                add(normalized)
+    if candidates:
+        return candidates
+
+    formats = [item for item in meta.get("formats", []) or [] if isinstance(item, dict)]
+    for fmt in formats:
+        language = _normalized_language_code(fmt.get("language"))
+        if language and _format_has_audio(fmt) and _audio_role_score(fmt) == 3:
+            add(language)
+    return candidates
+
+
+def original_audio_language(meta: dict[str, Any]) -> str | None:
+    """Return a source language only when metadata identifies it unambiguously."""
+    candidates = original_audio_language_candidates(meta)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def youtube_request_language(language: str | None) -> str | None:
+    """Map media-language tags to a safe YouTube UI language preference."""
+    normalized = _normalized_language_code(language)
+    if not normalized:
+        return None
+    special = {
+        "en-in": "en-IN",
+        "en-gb": "en-GB",
+        "es-419": "es-419",
+        "es-us": "es-US",
+        "fr-ca": "fr-CA",
+        "pt-pt": "pt-PT",
+        "sr-latn": "sr-Latn",
+        "zh-cn": "zh-CN",
+        "zh-hans": "zh-CN",
+        "zh-tw": "zh-TW",
+        "zh-hant": "zh-TW",
+        "zh-hk": "zh-HK",
+        "yue": "zh-HK",
+    }
+    if normalized in special:
+        return special[normalized]
+    base_language = normalized.split("-", 1)[0]
+    return {"he": "iw", "nb": "no", "nn": "no"}.get(base_language, base_language)
+
+
+def remember_original_audio_language(meta: dict[str, Any], language: str | None) -> str | None:
+    normalized = _normalized_language_code(language)
+    if normalized:
+        meta[ORIGINAL_AUDIO_LANGUAGE_FIELD] = normalized
+        return normalized
+    return None
+
+
+def audio_languages(meta: dict[str, Any]) -> set[str]:
+    formats = [item for item in meta.get("formats", []) or [] if isinstance(item, dict)]
+    candidates = formats or [meta]
+    return {
+        language
+        for fmt in candidates
+        if _format_has_audio(fmt) and (language := _normalized_language_code(fmt.get("language")))
+    }
+
+
+def metadata_has_original_audio(
+    meta: dict[str, Any],
+    original_language: str | None,
+    requested_language: str | None = None,
+) -> bool:
+    if not original_language:
+        return True
+    available_languages = audio_languages(meta)
+    if any(same_language(language, original_language) for language in available_languages):
+        return True
+    # Some player clients omit per-format language tags. A response explicitly
+    # requested in the source language is the strongest signal still available.
+    return not available_languages and same_language(requested_language, original_language)
 
 
 def _is_fragmented_format(fmt: dict[str, Any]) -> bool:
@@ -385,8 +558,14 @@ def _direct_urls(*formats: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
-def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[VideoFormatCandidate]:
+def build_video_candidates(
+    meta: dict[str, Any],
+    limit_bytes: int,
+    *,
+    original_language: str | None = None,
+) -> list[VideoFormatCandidate]:
     """Return size-screened, Telegram-compatible candidates, best first."""
+    original_language = original_language or original_audio_language(meta)
     formats = [item for item in meta.get("formats", []) or [] if isinstance(item, dict)]
     instagram = is_instagram_url(str(meta.get("webpage_url") or meta.get("original_url") or ""))
     raw: list[tuple[tuple[float, ...], VideoFormatCandidate]] = []
@@ -428,7 +607,19 @@ def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[Video
             direct_urls=_direct_urls(fmt),
             size_source=size_source,
         )
-        raw.append(((compatibility, height, fps, bitrate), candidate))
+        raw.append(
+            (
+                (
+                    _audio_role_score(fmt, original_language),
+                    compatibility,
+                    height,
+                    fps,
+                    bitrate,
+                    _positive_number(fmt.get("abr")),
+                ),
+                candidate,
+            )
+        )
 
     audio_formats = [
         fmt
@@ -439,18 +630,20 @@ def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[Video
         and fmt.get("format_id") is not None
     ]
     audio_formats.sort(
-        key=lambda fmt: (_positive_number(fmt.get("abr")), _positive_number(fmt.get("tbr"))),
+        key=lambda fmt: (
+            _audio_role_score(fmt, original_language),
+            _positive_number(fmt.get("abr")),
+            _positive_number(fmt.get("tbr")),
+        ),
         reverse=True,
     )
-    proven_audio: tuple[dict[str, Any], int, bool, str] | None = None
+    proven_audio: list[tuple[dict[str, Any], int, bool, str]] = []
     for audio in audio_formats:
         audio_size, audio_confident, audio_source = _component_size(audio)
         if audio_size is not None:
-            proven_audio = (audio, audio_size, audio_confident, audio_source)
-            break
+            proven_audio.append((audio, audio_size, audio_confident, audio_source))
 
-    if proven_audio:
-        audio, audio_size, audio_confident, audio_source = proven_audio
+    for audio, audio_size, audio_confident, audio_source in proven_audio:
         for video in formats:
             if (
                 str(video.get("ext") or "").lower() != "mp4"
@@ -475,7 +668,19 @@ def build_video_candidates(meta: dict[str, Any], limit_bytes: int) -> list[Video
                 direct_urls=_direct_urls(video, audio),
                 size_source=(video_source if video_source == audio_source else f"{video_source}+{audio_source}"),
             )
-            raw.append(((2, height, fps, bitrate), candidate))
+            raw.append(
+                (
+                    (
+                        _audio_role_score(audio, original_language),
+                        2,
+                        height,
+                        fps,
+                        bitrate,
+                        _positive_number(audio.get("abr") or audio.get("tbr")),
+                    ),
+                    candidate,
+                )
+            )
 
     raw.sort(key=lambda item: item[0], reverse=True)
     result: list[VideoFormatCandidate] = []
@@ -502,27 +707,96 @@ def apply_probe_if_needed(plan: VideoFormatCandidate | None) -> VideoFormatCandi
     return plan
 
 
-def build_audio_plan_mp3(meta: dict[str, Any], limit_bytes: int) -> tuple[dict[str, Any] | None, str | None]:
+def build_audio_plans_mp3(
+    meta: dict[str, Any],
+    limit_bytes: int,
+    *,
+    original_language: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     """
-    Audio is allowed only if we can confidently keep MP3 under the limit.
-    We compute it from duration and pick a bitrate that fits with headroom.
+    Return original-first audio sources at the highest safe MP3 bitrate.
+
+    Audio is offered only when its converted size can be estimated confidently.
     """
     dur = _duration_sec(meta)
     if not dur:
-        return None, "Cannot determine duration, so I can't reliably estimate MP3 size."
+        return [], "Cannot determine duration, so I can't reliably estimate MP3 size."
 
-    # Choose the highest standard bitrate that fits (with headroom)
+    # Choose the highest standard bitrate that fits (with headroom).
+    output_bitrate: int | None = None
     candidates = [192, 160, 128, 112, 96, 80, 64, 48, 32]
     for br in candidates:
         est = int(dur * (br * 1000 / 8))
         if est + AUDIO_HEADROOM_BYTES <= limit_bytes:
-            return {
-                "format_spec": "bestaudio/best",
-                "merge_output_format": None,
-                "mp3_kbps": br,
-                "estimated_size": est,
-                "estimated_confident": True,
-                "quality_label": f"mp3 {br}kbps",
-            }, None
+            output_bitrate = br
+            break
 
-    return None, f"Audio is too long to fit into {fmt_bytes(limit_bytes)} even at low bitrate."
+    if output_bitrate is None:
+        return [], f"Audio is too long to fit into {fmt_bytes(limit_bytes)} even at low bitrate."
+
+    original_language = original_language or original_audio_language(meta)
+    formats = [item for item in meta.get("formats", []) or [] if isinstance(item, dict)]
+    ranked: list[tuple[tuple[float, ...], str]] = []
+    has_audio_role_metadata = False
+    for fmt in formats:
+        format_id = str(fmt.get("format_id") or "").strip()
+        if not format_id or not _format_has_audio(fmt):
+            continue
+        role_score = _audio_role_score(fmt, original_language)
+        has_audio_role_metadata = has_audio_role_metadata or role_score != 2
+        audio_only = int(str(fmt.get("vcodec") or "").strip().lower() == "none")
+        source_bitrate = _positive_number(fmt.get("abr"))
+        if not source_bitrate and audio_only:
+            source_bitrate = _positive_number(fmt.get("tbr"))
+        codec_compatibility = int(str(fmt.get("acodec") or "").startswith("mp4a"))
+        ranked.append(
+            (
+                (
+                    role_score,
+                    audio_only,
+                    source_bitrate,
+                    _number(fmt.get("quality")),
+                    codec_compatibility,
+                ),
+                format_id,
+            )
+        )
+
+    format_specs = ["bestaudio/best"]
+    if has_audio_role_metadata and ranked:
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        format_specs = []
+        seen: set[str] = set()
+        for _score, format_id in ranked:
+            if format_id in seen:
+                continue
+            seen.add(format_id)
+            format_specs.append(format_id)
+
+    estimated_size = int(dur * (output_bitrate * 1000 / 8))
+    return [
+        {
+            "format_spec": format_spec,
+            "merge_output_format": None,
+            "mp3_kbps": output_bitrate,
+            "estimated_size": estimated_size,
+            "estimated_confident": True,
+            "quality_label": f"mp3 {output_bitrate}kbps",
+        }
+        for format_spec in format_specs
+    ], None
+
+
+def build_audio_plan_mp3(
+    meta: dict[str, Any],
+    limit_bytes: int,
+    *,
+    original_language: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return the preferred MP3 plan while preserving the existing public API."""
+    plans, reason = build_audio_plans_mp3(
+        meta,
+        limit_bytes,
+        original_language=original_language,
+    )
+    return (plans[0] if plans else None), reason

@@ -53,9 +53,11 @@ from app.planner import (
 from app.planner import (
     apply_youtube_runtime_opts as _apply_youtube_runtime_opts,
 )
+from app.planner import audio_languages as _audio_languages
 from app.planner import (
     build_audio_plan_mp3 as _build_audio_plan_mp3,
 )
+from app.planner import build_audio_plans_mp3 as _build_audio_plans_mp3
 from app.planner import build_video_candidates as _build_video_candidates
 from app.planner import (
     get_video_meta as _get_video_meta,
@@ -65,7 +67,12 @@ from app.planner import (
     is_instagram_url as _is_instagram_url,
 )
 from app.planner import is_youtube_url as _is_youtube_url
+from app.planner import metadata_has_original_audio as _metadata_has_original_audio
 from app.planner import metadata_without_format_selection as _metadata_without_format_selection
+from app.planner import original_audio_language as _original_audio_language
+from app.planner import original_audio_language_candidates as _original_audio_language_candidates
+from app.planner import remember_original_audio_language as _remember_original_audio_language
+from app.planner import same_language as _same_language
 from app.planner import youtube_player_clients as _youtube_player_clients
 from app.settings import Settings, load_settings
 from app.storage_guard import (
@@ -372,23 +379,143 @@ def _find_downloaded_file(
     return _find_downloaded_file_impl(info, output_folder, fallback_prefix, prefer_ext=prefer_ext)
 
 
+def _get_youtube_meta_for_client(
+    url: str,
+    player_client: str | None,
+    preferred_language: str | None,
+) -> tuple[dict[str, Any], str | None, bool]:
+    settings = _settings()
+
+    def extract(language: str | None) -> dict[str, Any]:
+        metadata = _get_video_meta(
+            url,
+            js_runtimes=settings.ytdlp_js_runtimes,
+            remote_components=settings.ytdlp_remote_components,
+            cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
+            youtube_player_client=player_client,
+            youtube_language=language,
+            generic_impersonate=None,
+        )
+        if not isinstance(metadata, dict) or not _has_downloadable_video(metadata):
+            raise RuntimeError("extractor returned metadata without a downloadable video")
+        _validate_metadata_urls(metadata)
+        return metadata
+
+    requested_language = preferred_language
+    candidate = extract(requested_language)
+    discovered_language = preferred_language
+    if not discovered_language:
+        language_candidates = _original_audio_language_candidates(candidate)
+        if len(language_candidates) == 1:
+            discovered_language = language_candidates[0]
+        elif language_candidates:
+            # A player response can mark both the source and a regional
+            # automatic dub as `*-orig`. Re-query the bounded candidate set;
+            # the true source marker remains common while a dub is localized.
+            common_languages = set(language_candidates)
+            probes: list[tuple[str, dict[str, Any], set[str]]] = []
+            for language in language_candidates[:4]:
+                try:
+                    localized = extract(language)
+                except Exception as error:
+                    LOGGER.info(
+                        "YouTube audio-language probe failed client=%s language=%s error=%s detail=%s",
+                        player_client or "default",
+                        language,
+                        type(error).__name__,
+                        safe_error_for_log(error),
+                    )
+                    continue
+                localized_languages = set(_original_audio_language_candidates(localized))
+                probes.append((language, localized, localized_languages))
+                if localized_languages:
+                    common_languages.intersection_update(localized_languages)
+
+            if len(common_languages) == 1:
+                discovered_language = next(iter(common_languages))
+                matching_probe = next(
+                    (
+                        probe
+                        for language, probe, _languages in probes
+                        if _same_language(language, discovered_language)
+                    ),
+                    None,
+                )
+                if matching_probe is None:
+                    try:
+                        matching_probe = extract(discovered_language)
+                    except Exception as error:
+                        LOGGER.info(
+                            "YouTube resolved-language retry failed client=%s language=%s error=%s detail=%s",
+                            player_client or "default",
+                            discovered_language,
+                            type(error).__name__,
+                            safe_error_for_log(error),
+                        )
+                if matching_probe is not None:
+                    candidate = matching_probe
+                    requested_language = discovered_language
+            elif probes:
+                def probe_score(item: tuple[str, dict[str, Any], set[str]]) -> tuple[int, int, int, int]:
+                    language, probe, probe_languages = item
+                    available = _audio_languages(probe)
+                    return (
+                        int(len(probe_languages) == 1 and any(_same_language(value, language) for value in probe_languages)),
+                        int(any(_same_language(value, language) for value in available)),
+                        int(any(_same_language(value, language) for value in probe_languages)),
+                        -len(probe_languages),
+                    )
+
+                discovered_language, candidate, _probe_languages = max(probes, key=probe_score)
+                requested_language = discovered_language
+            else:
+                discovered_language = language_candidates[0]
+
+    has_original = _metadata_has_original_audio(candidate, discovered_language, requested_language)
+
+    if discovered_language and not has_original and not _same_language(requested_language, discovered_language):
+        try:
+            localized = extract(discovered_language)
+        except Exception as error:
+            LOGGER.info(
+                "YouTube original-language metadata retry failed client=%s language=%s error=%s detail=%s",
+                player_client or "default",
+                discovered_language,
+                type(error).__name__,
+                safe_error_for_log(error),
+            )
+        else:
+            candidate = localized
+            has_original = _metadata_has_original_audio(candidate, discovered_language, discovered_language)
+
+    _remember_original_audio_language(candidate, discovered_language)
+    return candidate, discovered_language, has_original
+
+
 def _get_video_meta_with_hidden_retries(url: str) -> dict[str, Any]:
     settings = _settings()
     if _is_youtube_url(url):
         last_error: Exception | None = None
+        fallback_meta: dict[str, Any] | None = None
+        preferred_language: str | None = None
         for player_client in _youtube_player_clients(settings.ytdlp_youtube_player_clients):
             try:
-                meta = _get_video_meta(
+                meta, discovered_language, has_original = _get_youtube_meta_for_client(
                     url,
-                    js_runtimes=settings.ytdlp_js_runtimes,
-                    remote_components=settings.ytdlp_remote_components,
-                    cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
-                    youtube_player_client=player_client,
-                    generic_impersonate=None,
+                    player_client,
+                    preferred_language,
                 )
-                if not isinstance(meta, dict) or not _has_downloadable_video(meta):
-                    raise RuntimeError("extractor returned metadata without a downloadable video")
-                _validate_metadata_urls(meta)
+                preferred_language = discovered_language or preferred_language
+                if discovered_language and not has_original:
+                    if fallback_meta is None:
+                        fallback_meta = meta
+                    LOGGER.info(
+                        "YouTube client omitted original audio client=%s language=%s available=%s",
+                        player_client or "default",
+                        discovered_language,
+                        ",".join(sorted(_audio_languages(meta))) or "unknown",
+                    )
+                    continue
                 return meta
             except Exception as exc:
                 last_error = exc
@@ -397,6 +524,8 @@ def _get_video_meta_with_hidden_retries(url: str) -> dict[str, Any]:
                     player_client or "default",
                     exc_info=True,
                 )
+        if fallback_meta is not None:
+            return fallback_meta
         raise RuntimeError("all YouTube metadata clients failed") from last_error
 
     try:
@@ -537,11 +666,13 @@ def _download_and_send(job: DownloadJob) -> None:
         return
     file_path: str | None = None
     settings = _settings()
+    initial_youtube_language = _original_audio_language(job.metadata) if _is_youtube_url(url) else None
 
     def build_options(
         plan: VideoFormatCandidate | dict[str, Any],
         tmp_id: str,
         youtube_player_client: str | None = None,
+        youtube_language: str | None = None,
         instagram_impersonate: bool = True,
         generic_impersonate: bool = False,
     ) -> dict[str, Any]:
@@ -597,6 +728,7 @@ def _download_and_send(job: DownloadJob) -> None:
             settings.ytdlp_js_runtimes,
             settings.ytdlp_remote_components,
             player_client=youtube_player_client,
+            youtube_language=youtube_language,
         )
         _apply_instagram_stability_opts(
             options,
@@ -623,15 +755,36 @@ def _download_and_send(job: DownloadJob) -> None:
             ]
         return options
 
-    initial_plans: list[VideoFormatCandidate | dict[str, Any]] = (
-        ([job.audio_plan] if job.audio_plan else []) if mode == "audio" else list(job.video_candidates)
-    )
+    if mode == "audio":
+        initial_audio_plans, _initial_audio_reason = _build_audio_plans_mp3(
+            job.metadata,
+            MAX_SEND_BYTES,
+            original_language=initial_youtube_language,
+        )
+        initial_plans: list[VideoFormatCandidate | dict[str, Any]] = list(
+            initial_audio_plans or ([job.audio_plan] if job.audio_plan else [])
+        )
+    else:
+        initial_plans = list(job.video_candidates)
 
-    def fresh_plans(metadata: dict[str, Any]) -> list[VideoFormatCandidate | dict[str, Any]]:
+    def fresh_plans(
+        metadata: dict[str, Any],
+        youtube_language: str | None = None,
+    ) -> list[VideoFormatCandidate | dict[str, Any]]:
         if mode == "audio":
-            audio_plan, _reason = _build_audio_plan_mp3(metadata, MAX_SEND_BYTES)
-            return [audio_plan] if audio_plan else []
-        return list(_build_video_candidates(metadata, MAX_SEND_BYTES))
+            audio_plans, _reason = _build_audio_plans_mp3(
+                metadata,
+                MAX_SEND_BYTES,
+                original_language=youtube_language,
+            )
+            return list(audio_plans)
+        return list(
+            _build_video_candidates(
+                metadata,
+                MAX_SEND_BYTES,
+                original_language=youtube_language,
+            )
+        )
 
     def cleanup_attempt_files() -> None:
         try:
@@ -646,6 +799,7 @@ def _download_and_send(job: DownloadJob) -> None:
         *,
         phase: str,
         youtube_player_client: str | None = None,
+        youtube_language: str | None = None,
         concurrent_fragments: int | None = None,
         instagram_impersonate: bool = True,
         generic_impersonate: bool = False,
@@ -658,6 +812,7 @@ def _download_and_send(job: DownloadJob) -> None:
                 plan,
                 tmp_id,
                 youtube_player_client=youtube_player_client,
+                youtube_language=youtube_language,
                 instagram_impersonate=instagram_impersonate,
                 generic_impersonate=generic_impersonate,
             )
@@ -715,19 +870,13 @@ def _download_and_send(job: DownloadJob) -> None:
                 _check_job(job_id, deadline)
         return None
 
-    def extract_fresh_youtube(player_client: str | None) -> dict[str, Any]:
-        metadata = _get_video_meta(
+    def extract_fresh_youtube(player_client: str | None) -> tuple[dict[str, Any], str | None]:
+        metadata, discovered_language, _has_original = _get_youtube_meta_for_client(
             url,
-            js_runtimes=settings.ytdlp_js_runtimes,
-            remote_components=settings.ytdlp_remote_components,
-            cookies_file=str(settings.cookies_file) if settings.cookies_file else None,
-            youtube_player_client=player_client,
-            generic_impersonate=settings.ytdlp_generic_impersonate,
+            player_client,
+            initial_youtube_language,
         )
-        if not isinstance(metadata, dict) or not _has_downloadable_video(metadata):
-            raise RuntimeError("extractor returned metadata without a downloadable video")
-        _validate_metadata_urls(metadata)
-        return metadata
+        return metadata, discovered_language or initial_youtube_language
 
     try:
         _check_job(job_id, deadline)
@@ -740,15 +889,20 @@ def _download_and_send(job: DownloadJob) -> None:
             force=True,
         )
 
-        file_path = try_plans(job.metadata, initial_plans, phase="initial")
+        file_path = try_plans(
+            job.metadata,
+            initial_plans,
+            phase="initial",
+            youtube_language=initial_youtube_language,
+        )
 
         if file_path is None and _is_youtube_url(url):
             for player_client in _youtube_player_clients(settings.ytdlp_youtube_player_clients):
                 _check_job(job_id, deadline)
                 cleanup_attempt_files()
                 try:
-                    fresh_metadata = extract_fresh_youtube(player_client)
-                    candidate_plans = fresh_plans(fresh_metadata)
+                    fresh_metadata, fresh_language = extract_fresh_youtube(player_client)
+                    candidate_plans = fresh_plans(fresh_metadata, fresh_language)
                     if not candidate_plans:
                         raise RuntimeError("fresh metadata has no eligible download candidates")
                 except (JobCancelled, JobTimedOut):
@@ -768,6 +922,7 @@ def _download_and_send(job: DownloadJob) -> None:
                     candidate_plans,
                     phase="fresh",
                     youtube_player_client=player_client,
+                    youtube_language=fresh_language,
                     concurrent_fragments=1,
                 )
                 if file_path is not None:

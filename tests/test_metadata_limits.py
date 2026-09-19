@@ -33,6 +33,116 @@ def test_youtube_metadata_skips_client_without_downloadable_video(tmp_path, monk
     assert clients_seen == [None, "android"]
 
 
+def test_youtube_metadata_reextracts_regional_dub_in_original_language(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    settings = Settings(**{**settings.__dict__, "ytdlp_youtube_player_clients": "default,android"})
+    main.SETTINGS = settings
+    requests_seen: list[tuple[str | None, str | None]] = []
+
+    def fake_get_video_meta(_url, **kwargs):
+        client = kwargs.get("youtube_player_client")
+        language = kwargs.get("youtube_language")
+        requests_seen.append((client, language))
+        returned_language = "ru" if language == "ru" else "en-US"
+        return {
+            "automatic_captions": {"ru-orig": [{"name": "Russian (Original)"}]},
+            "formats": [
+                {
+                    "format_id": "18",
+                    "ext": "mp4",
+                    "vcodec": "avc1.42001e",
+                    "acodec": "mp4a.40.2",
+                    "language": returned_language,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(main, "_get_video_meta", fake_get_video_meta)
+    monkeypatch.setattr(main, "_validate_metadata_urls", lambda _metadata: None)
+
+    metadata = main._get_video_meta_with_hidden_retries("https://www.youtube.com/watch?v=example")
+
+    assert requests_seen == [(None, None), (None, "ru")]
+    assert metadata["formats"][0]["language"] == "ru"
+    assert main._original_audio_language(metadata) == "ru"
+
+
+def test_youtube_metadata_resolves_multiple_original_caption_markers(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    settings = Settings(**{**settings.__dict__, "ytdlp_youtube_player_clients": "default,android"})
+    main.SETTINGS = settings
+    requests_seen: list[tuple[str | None, str | None]] = []
+
+    def fake_get_video_meta(_url, **kwargs):
+        client = kwargs.get("youtube_player_client")
+        language = kwargs.get("youtube_language")
+        requests_seen.append((client, language))
+        is_russian = language == "ru"
+        captions = (
+            {"ru-orig": [{"name": "Russian (Original)"}]}
+            if is_russian
+            else {
+                "en-US-orig": [{"name": "English (United States) (Original)"}],
+                "ru-orig": [{"name": "Russian (Original)"}],
+            }
+        )
+        return {
+            "automatic_captions": captions,
+            "formats": [
+                {
+                    "format_id": "18",
+                    "ext": "mp4",
+                    "vcodec": "avc1.42001e",
+                    "acodec": "mp4a.40.2",
+                    "language": "ru" if is_russian else "en-US",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(main, "_get_video_meta", fake_get_video_meta)
+    monkeypatch.setattr(main, "_validate_metadata_urls", lambda _metadata: None)
+
+    metadata = main._get_video_meta_with_hidden_retries("https://www.youtube.com/watch?v=example")
+
+    assert requests_seen == [(None, None), (None, "en-us"), (None, "ru")]
+    assert metadata["formats"][0]["language"] == "ru"
+    assert main._original_audio_language(metadata) == "ru"
+
+
+def test_youtube_metadata_uses_dub_only_after_all_clients_omit_original(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    settings = Settings(**{**settings.__dict__, "ytdlp_youtube_player_clients": "default,android"})
+    main.SETTINGS = settings
+    requests_seen: list[tuple[str | None, str | None]] = []
+
+    def fake_get_video_meta(_url, **kwargs):
+        client = kwargs.get("youtube_player_client")
+        language = kwargs.get("youtube_language")
+        requests_seen.append((client, language))
+        return {
+            "automatic_captions": {"ru-orig": [{"name": "Russian (Original)"}]},
+            "formats": [
+                {
+                    "format_id": "18",
+                    "ext": "mp4",
+                    "vcodec": "avc1.42001e",
+                    "acodec": "mp4a.40.2",
+                    "language": "en-US",
+                    "format_note": "English - dubbed-auto (default)",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(main, "_get_video_meta", fake_get_video_meta)
+    monkeypatch.setattr(main, "_validate_metadata_urls", lambda _metadata: None)
+
+    metadata = main._get_video_meta_with_hidden_retries("https://www.youtube.com/watch?v=example")
+
+    assert requests_seen == [(None, None), (None, "ru"), ("android", "ru")]
+    assert metadata["formats"][0]["language"] == "en-US"
+    assert main._original_audio_language(metadata) == "ru"
+
+
 def _settings(tmp_path: Path, *, workers: int = 1, timeout: int = 5) -> Settings:
     return Settings(
         token="123:test-token-value-abcdefghijklmnop",

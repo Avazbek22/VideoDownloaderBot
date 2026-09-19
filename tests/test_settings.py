@@ -93,8 +93,13 @@ def test_ytdlp_and_metadata_settings_are_loaded_from_local_env(tmp_path, monkeyp
         "https://www.youtube.com/watch?v=example",
         settings.ytdlp_js_runtimes,
         settings.ytdlp_remote_components,
+        player_client="android",
+        youtube_language="ru",
     )
     assert "remote_components" not in options
+    assert options["format_sort"] == ["lang"]
+    assert options["format_sort_force"] is True
+    assert options["extractor_args"] == {"youtube": {"player_client": ["android"], "lang": ["ru"]}}
     generic_options = apply_generic_impersonation_opts(
         {},
         "https://example.com/video",
