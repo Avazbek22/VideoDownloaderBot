@@ -1,8 +1,9 @@
-name: ${COMPOSE_PROJECT_NAME:-videodownloaderbot}
+name: ${APP_SLUG:-videodownloaderbot}
 
 services:
   videodownloaderbot:
-    image: videodownloaderbot:local
+    # Deployment builds candidates as :candidate; :local is the running release.
+    image: ${APP_SLUG:-videodownloaderbot}:${APP_IMAGE_TAG:-local}
     build:
       context: .
     restart: unless-stopped

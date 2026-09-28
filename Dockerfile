@@ -35,8 +35,10 @@ COPY requirements.txt /app/requirements.txt
 RUN sed '/^yt-dlp/d' /app/requirements.txt >/tmp/requirements-base.txt \
     && pip install --no-cache-dir -r /tmp/requirements-base.txt
 
-ARG YTDLP_CACHEBUST=initial
-RUN echo "$YTDLP_CACHEBUST" >/tmp/ytdlp-cachebust \
+# Scheduled rebuilds (deploy.conf) pass a new REBUILD_STAMP, which refreshes
+# yt-dlp without rebuilding the slower OS and Python dependency layers.
+ARG REBUILD_STAMP=initial
+RUN echo "$REBUILD_STAMP" >/tmp/rebuild-stamp \
     && pip install --no-cache-dir --upgrade 'yt-dlp[default,curl-cffi]'
 
 COPY app /app/app

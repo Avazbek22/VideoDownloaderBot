@@ -1,0 +1,13 @@
+[Unit]
+Description=Deploy __APP_SLUG__ from its Git repository
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__INSTALL_DIR__
+Environment="ROOT_DIR=__INSTALL_DIR__"
+Environment=APP_SLUG=__APP_SLUG__
+ExecStart=/usr/bin/env bash "__INSTALL_DIR__/scripts/deploy.sh"
+TimeoutStartSec=45min

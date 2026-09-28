@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 import main
 from app import healthcheck
 
@@ -53,3 +55,51 @@ def test_dead_worker_marks_application_unhealthy(monkeypatch, tmp_path) -> None:
     assert main.fatal_lifecycle_error.is_set()
     assert not marker.exists()
     assert len(alerts) == 1
+
+
+def test_stale_polling_reports_unhealthy_and_recovers(monkeypatch, tmp_path) -> None:
+    marker = tmp_path / "health"
+    monkeypatch.setattr(main, "HEALTH_MARKER", marker)
+    main.stop_event.clear()
+    main.maintenance_finished.clear()
+    main.poll_stale.clear()
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait)
+    worker.start()
+    main.worker_threads[:] = [worker]
+    try:
+        monkeypatch.setattr(main, "last_successful_poll", time.monotonic() - 1000)
+        assert main._heartbeat() is True
+        assert not marker.exists()
+        assert not main.stop_event.is_set()
+
+        monkeypatch.setattr(main, "last_successful_poll", time.monotonic())
+        assert main._heartbeat() is True
+        assert marker.exists()
+        assert not main.poll_stale.is_set()
+    finally:
+        release.set()
+        worker.join()
+        main.worker_threads.clear()
+
+
+def test_successful_poll_is_recorded(monkeypatch) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.fail = False
+
+        def get_updates(self, *args, **kwargs):
+            if self.fail:
+                raise ConnectionError("Conflict: terminated by other getUpdates request")
+            return []
+
+    fake = FakeBot()
+    monkeypatch.setattr(main, "last_successful_poll", 0.0)
+    main._record_successful_polls(fake)
+    fake.fail = True
+    with pytest.raises(ConnectionError):
+        fake.get_updates(offset=1)
+    assert main.last_successful_poll == 0.0
+    fake.fail = False
+    assert fake.get_updates(offset=1) == []
+    assert main.last_successful_poll > 0.0

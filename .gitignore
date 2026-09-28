@@ -199,6 +199,7 @@ data/*
 !data/.gitkeep
 logs/*
 !logs/.gitkeep
+.deploy/
 cookies*.txt
 
 # Ruff stuff:

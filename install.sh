@@ -1,240 +1,176 @@
 #!/usr/bin/env bash
+# One-time server setup that is safe to run again at any time. It installs
+# Docker when it is missing, prepares .env, starts the checked-out commit as a
+# verified release, and enables automatic deployment for this bot only.
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_REPOSITORY="https://github.com/Avazbek22/VideoDownloaderBot.git"
-BRANCH="main"
-COMPOSE_PROJECT="${COMPOSE_PROJECT:-videodownloaderbot}"
-SERVICE_KEY="videodownloaderbot"
-DOCKER_WITH_SUDO=0
-previous_commit=""
-previous_image=0
-previous_running=0
-transaction_started=0
-replacement_attempted=0
+REPOSITORY="${REPOSITORY:-https://github.com/Avazbek22/VideoDownloaderBot.git}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ -d "$SCRIPT_DIR/.git" ]]; then
-  INSTALL_DIR="${INSTALL_DIR:-$SCRIPT_DIR}"
-  if git -C "$SCRIPT_DIR" remote get-url origin >/dev/null 2>&1; then
-    REPOSITORY="${REPOSITORY:-$(git -C "$SCRIPT_DIR" remote get-url origin)}"
-  else
-    REPOSITORY="${REPOSITORY:-$DEFAULT_REPOSITORY}"
+# `bash <(curl -fsSL .../install.sh)` runs this file without a checkout next to
+# it: clone the repository as the current user first, then run its installer.
+if [[ ! -f "$ROOT_DIR/scripts/lib-production.sh" ]]; then
+  target="${INSTALL_DIR:-$PWD/VideoDownloaderBot}"
+  if [[ ! -d "$target/.git" ]]; then
+    command -v git >/dev/null 2>&1 || {
+      printf 'Install git first: sudo apt-get install -y git\n' >&2
+      exit 1
+    }
+    git clone --branch main "$REPOSITORY" "$target"
   fi
-else
-  INSTALL_DIR="${INSTALL_DIR:-$PWD/VideoDownloaderBot}"
-  REPOSITORY="${REPOSITORY:-$DEFAULT_REPOSITORY}"
+  exec bash "$target/install.sh" "$@"
 fi
 
-info() { printf '\n\033[1;36m%s\033[0m\n' "$*"; }
-ok() { printf '\033[32m✓\033[0m %s\n' "$*"; }
-die() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1; }
-as_root() { if [[ "$(id -u)" == "0" ]]; then "$@"; else need sudo || die "sudo is required"; sudo "$@"; fi; }
-docker_cmd() {
-  if [[ "$DOCKER_WITH_SUDO" == "1" ]]; then
-    sudo docker "$@"
-  else
-    docker "$@"
-  fi
+if [[ "$(id -u)" != "0" ]]; then
+  command -v sudo >/dev/null 2>&1 || {
+    printf 'Run install.sh as root.\n' >&2
+    exit 1
+  }
+  exec sudo --preserve-env=BOT_TOKEN,APP_NAME,APP_SLUG,INSTALL_SKIP_PREREQUISITES \
+    bash "$ROOT_DIR/install.sh" "$@"
+fi
+LIBRARY="$ROOT_DIR/scripts/lib-production.sh"
+[[ -f "$LIBRARY" ]] || {
+  printf 'Run install.sh from a complete repository checkout.\n' >&2
+  exit 1
 }
-compose() {
-  if docker_cmd compose version >/dev/null 2>&1; then
-    docker_cmd compose "$@"
-  elif [[ "$DOCKER_WITH_SUDO" == "1" ]]; then
-    sudo docker-compose "$@"
-  else
-    docker-compose "$@"
-  fi
-}
+# shellcheck source=scripts/lib-production.sh
+source "$LIBRARY"
 
 install_prerequisites() {
-  info "Installing production prerequisites"
-  if ! need git || ! need docker || ! need flock; then
-    need apt-get || die "Install Git, Docker and util-linux manually"
-    as_root apt-get update -y
-    need git || as_root apt-get install -y --no-install-recommends git ca-certificates
-    need docker || as_root apt-get install -y --no-install-recommends docker.io
-    need flock || as_root apt-get install -y --no-install-recommends util-linux
+  local -a packages=()
+  if [[ "${INSTALL_SKIP_PREREQUISITES:-0}" == "1" ]]; then
+    return 0
   fi
-  if need systemctl; then
-    as_root systemctl enable --now docker
+  [[ -r /etc/os-release ]] || die "Ubuntu 22.04 or 24.04 is required"
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  [[ "${ID:-}" == "ubuntu" ]] || die "Ubuntu 22.04 or 24.04 is required"
+  case "${VERSION_ID:-}" in
+    22.04 | 24.04) ;;
+    *) die "Supported Ubuntu versions are 22.04 and 24.04" ;;
+  esac
+
+  command_exists git || packages+=(git)
+  command_exists docker || packages+=(docker.io)
+  command_exists flock || packages+=(util-linux)
+  command_exists curl || packages+=(curl)
+  command_exists python3 || packages+=(python3)
+  dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'ok installed' ||
+    packages+=(ca-certificates)
+  if ((${#packages[@]} > 0)); then
+    apt-get update
+    apt-get install -y --no-install-recommends "${packages[@]}"
   fi
-  if ! docker info >/dev/null 2>&1; then
-    need sudo || die "Current user cannot access the Docker daemon and sudo is unavailable"
-    sudo docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
-    DOCKER_WITH_SUDO=1
+  systemctl enable --now docker
+  docker info >/dev/null 2>&1 || die "The Docker daemon is not running"
+
+  if ! docker compose version >/dev/null 2>&1 && ! command_exists docker-compose; then
+    apt-get install -y --no-install-recommends docker-compose-v2 ||
+      apt-get install -y --no-install-recommends docker-compose-plugin ||
+      apt-get install -y --no-install-recommends docker-compose
   fi
-  if ! docker_cmd compose version >/dev/null 2>&1 && ! need docker-compose; then
-    if ! as_root apt-get install -y --no-install-recommends docker-compose-plugin; then
-      as_root apt-get install -y --no-install-recommends docker-compose
-    fi
-  fi
-  (docker_cmd compose version >/dev/null 2>&1 || need docker-compose) || die "Docker Compose is unavailable"
-  ok "Docker production prerequisites are ready"
+  compose version >/dev/null
 }
 
-capture_previous_state() {
-  [[ -d "$INSTALL_DIR/.git" ]] || return 0
-  previous_commit="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
-  if docker_cmd image inspect videodownloaderbot:local >/dev/null 2>&1; then
-    docker_cmd image tag videodownloaderbot:local videodownloaderbot:install-rollback
-    previous_image=1
-  fi
-  local container_id
-  container_id="$(compose -p "$COMPOSE_PROJECT" -f "$INSTALL_DIR/docker-compose.yml" ps -q "$SERVICE_KEY")"
-  if [[ -n "$container_id" ]] \
-    && [[ "$(docker_cmd inspect --format '{{.State.Running}}' "$container_id")" == "true" ]]; then
-    previous_running=1
-  fi
-  transaction_started=1
-}
-
-rollback_install() {
-  local code=$?
-  [[ "$code" -ne 0 ]] || code=1
-  trap - ERR INT TERM EXIT
-  if [[ "$transaction_started" == "1" ]]; then
-    info "Installation failed; restoring the previous deployment"
-    if [[ -n "$previous_commit" ]]; then
-      if ! git -C "$INSTALL_DIR" checkout -q -B "$BRANCH" "$previous_commit"; then
-        printf 'Failed to restore Git commit %s\n' "$previous_commit" >&2
-      fi
-    fi
-    if [[ "$previous_image" == "1" ]]; then
-      if ! docker_cmd image tag videodownloaderbot:install-rollback videodownloaderbot:local; then
-        printf 'Failed to restore Docker image\n' >&2
-      fi
-    fi
-    if [[ "$previous_running" == "1" && "$replacement_attempted" == "1" ]]; then
-      if ! compose -p "$COMPOSE_PROJECT" -f "$INSTALL_DIR/docker-compose.yml" \
-        up -d --no-deps --force-recreate "$SERVICE_KEY"; then
-        printf 'Failed to restore previous container\n' >&2
-      fi
-    fi
-  fi
-  exit "$code"
-}
-
-prepare_repository() {
-  info "Preparing origin/main checkout"
-  if [[ -d "$INSTALL_DIR/.git" ]]; then
-    # Executable modes are applied below for the production host. Avoid making
-    # those intentional mode-only changes block future content deployments.
-    git -C "$INSTALL_DIR" config core.fileMode false
-    [[ -z "$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=no)" ]] \
-      || die "Tracked local changes detected in $INSTALL_DIR"
-    git -C "$INSTALL_DIR" fetch origin "$BRANCH"
-    git -C "$INSTALL_DIR" checkout "$BRANCH"
-    git -C "$INSTALL_DIR" pull --ff-only origin "$BRANCH"
-  else
-    git clone --branch "$BRANCH" --single-branch "$REPOSITORY" "$INSTALL_DIR"
-  fi
-  git -C "$INSTALL_DIR" config core.fileMode false
-  ok "Repository is ready at $INSTALL_DIR"
+validate_repository() {
+  local branch
+  [[ -d "$ROOT_DIR/.git" ]] ||
+    die "Clone the repository with git before running install.sh"
+  run_git remote get-url origin >/dev/null 2>&1 ||
+    die "Git remote 'origin' is required for automatic deployment"
+  branch="$(run_git branch --show-current)"
+  [[ "$branch" == "$DEPLOY_BRANCH" ]] ||
+    die "Check out $DEPLOY_BRANCH before running install.sh (now on '$branch')"
+  [[ -z "$(run_git status --porcelain --untracked-files=no)" ]] ||
+    die "Tracked files have local changes in $ROOT_DIR; commit or restore them first"
 }
 
 prepare_environment() {
-  info "Preparing persistent configuration and directories"
-  local env_file="$INSTALL_DIR/.env"
+  local env_file="$ROOT_DIR/.env" token owner
   if [[ ! -f "$env_file" ]]; then
-    cp "$INSTALL_DIR/.env-example" "$env_file"
+    install -m 600 "$ROOT_DIR/.env-example" "$env_file"
   fi
-  if ! grep -Eq '^BOT_TOKEN=.+$' "$env_file"; then
-    local token="${BOT_TOKEN:-}"
+  token="$(env_value BOT_TOKEN "$env_file")"
+  if [[ -z "$token" ]]; then
+    token="${BOT_TOKEN:-}"
     if [[ -z "$token" ]]; then
+      [[ -t 0 ]] || die "BOT_TOKEN is required; pass it as an environment variable"
       printf 'Telegram BOT_TOKEN: ' >&2
       read -r -s token
       printf '\n' >&2
     fi
-    [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || die "BOT_TOKEN has an invalid format"
-    local temporary="$env_file.tmp"
-    awk -v token="$token" 'BEGIN{done=0} /^BOT_TOKEN=/{print "BOT_TOKEN=" token; done=1; next} {print} END{if(!done) print "BOT_TOKEN=" token}' \
-      "$env_file" >"$temporary"
-    mv "$temporary" "$env_file"
+    [[ "$token" =~ ^$TOKEN_REGEX$ ]] || die "BOT_TOKEN has an invalid format"
+    set_env_value BOT_TOKEN "$token" "$env_file"
+  elif [[ ! "$token" =~ ^$TOKEN_REGEX$ ]]; then
+    die "BOT_TOKEN in .env has an invalid format"
+  fi
+
+  if [[ -z "$(env_value APP_NAME "$env_file")" && -n "${APP_NAME:-}" ]]; then
+    set_env_value APP_NAME "$APP_NAME" "$env_file"
+  fi
+  # Pin the name so that renaming the directory never orphans the bot.
+  resolve_app_slug
+  if [[ "$(env_value APP_SLUG "$env_file")" != "$APP_SLUG" ]]; then
+    set_env_value APP_SLUG "$APP_SLUG" "$env_file"
   fi
   chmod 600 "$env_file"
-  mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
-  as_root chown -R 10001:10001 "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
-  chmod 0755 "$INSTALL_DIR/scripts/deploy.sh" "$INSTALL_DIR/scripts/update-ytdlp.sh" \
-    "$INSTALL_DIR/scripts/docker-entrypoint.sh"
-  ok ".env, data/ and logs/ are preserved and ready"
+  owner="$(stat -c '%u:%g' "$ROOT_DIR/.git")"
+  chown "$owner" "$env_file"
+
+  mkdir -p "$ROOT_DIR/data" "$ROOT_DIR/logs"
+  chown -R 10001:10001 "$ROOT_DIR/data" "$ROOT_DIR/logs"
 }
 
-wait_until_healthy() {
-  local id running health attempt stable=0
-  for ((attempt = 1; attempt <= 30; attempt++)); do
-    id="$(compose -p "$COMPOSE_PROJECT" -f "$INSTALL_DIR/docker-compose.yml" ps -q "$SERVICE_KEY")"
-    if [[ -n "$id" ]]; then
-      running="$(docker_cmd inspect --format '{{.State.Running}}' "$id")"
-      health="$(docker_cmd inspect --format \
-        '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id")"
-      if [[ "$running" == "true" && "$health" == "healthy" ]]; then
-        stable=$((stable + 1))
-        [[ "$stable" -ge 5 ]] && return 0
-      else
-        stable=0
-      fi
-    fi
-    sleep 2
-  done
-  return 1
-}
-
-start_bot() {
-  info "Building and validating the production image"
-  cd "$INSTALL_DIR"
-  if docker_cmd image inspect videodownloaderbot:local >/dev/null 2>&1; then
-    docker_cmd image tag videodownloaderbot:local videodownloaderbot:rollback
+# Older versions of these scripts kept rollback state in data/, extra image
+# tags, and a separate yt-dlp updater timer, which the scheduled rebuild in
+# deploy.conf now replaces. The running container is adopted by
+# adopt_running_release.
+migrate_legacy_state() {
+  local tag unit legacy_failed="$ROOT_DIR/data/.failed-deploy-sha"
+  if [[ -f "$legacy_failed" && ! -f "$(state_file failed-commit)" ]]; then
+    tr -d '[:space:]' <"$legacy_failed" >"$(state_file failed-commit)"
   fi
-  compose -p "$COMPOSE_PROJECT" build --pull "$SERVICE_KEY"
-  compose -p "$COMPOSE_PROJECT" run --rm --no-deps "$SERVICE_KEY" sh -ec '
-    python -c "import main"
-    ffmpeg -version >/dev/null
-    node --version >/dev/null
-    python -m yt_dlp --version >/dev/null
-    python -c "import telebot; from app.settings import load_settings; telebot.TeleBot(load_settings().token).get_me()"
-  '
-  replacement_attempted=1
-  compose -p "$COMPOSE_PROJECT" up -d --no-deps --force-recreate "$SERVICE_KEY"
-  wait_until_healthy || die "Container did not reach a stable healthy state"
-  ok "VideoDownloaderBot is healthy"
+  rm -f "$legacy_failed" "$ROOT_DIR/data/.rollback-commit"
+  for tag in rollback install-rollback pre-manual-rollback; do
+    remove_image_tag "$APP_SLUG:$tag"
+  done
+  unit="$APP_SLUG-yt-dlp-update"
+  if [[ -f "$SYSTEMD_DIR/$unit.timer" || -f "$SYSTEMD_DIR/$unit.service" ]]; then
+    "$SYSTEMCTL" disable --now "$unit.timer" >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_DIR/$unit.timer" "$SYSTEMD_DIR/$unit.service"
+    "$SYSTEMCTL" daemon-reload || true
+    log "Removed the old $unit timer; deploy.conf schedules yt-dlp rebuilds now"
+  fi
 }
 
-install_systemd_units() {
-  need systemctl || return 0
-  [[ -d /run/systemd/system ]] || return 0
-  info "Installing deployment and yt-dlp update timers"
-  local unit source target
-  for unit in videodownloaderbot-deploy.service videodownloaderbot-yt-dlp-update.service; do
-    source="$INSTALL_DIR/scripts/systemd/$unit"
-    target="/etc/systemd/system/$unit"
-    sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
-        -e "s|__COMPOSE_PROJECT__|$COMPOSE_PROJECT|g" \
-        -e "s|__SERVICE_KEY__|$SERVICE_KEY|g" "$source" | as_root tee "$target" >/dev/null
-  done
-  for unit in videodownloaderbot-deploy.timer videodownloaderbot-yt-dlp-update.timer; do
-    as_root cp "$INSTALL_DIR/scripts/systemd/$unit" "/etc/systemd/system/$unit"
-  done
-  as_root systemctl daemon-reload
-  as_root systemctl enable --now videodownloaderbot-deploy.timer videodownloaderbot-yt-dlp-update.timer
-  ok "origin/main deployment and nightly yt-dlp timers are enabled"
+print_summary() {
+  log "Installation complete: $APP_SLUG"
+  cat <<SUMMARY
+
+Every push to $DEPLOY_BRANCH is now deployed automatically once its CI checks pass.
+
+  Status:    sudo bash scripts/status.sh
+  Roll back: sudo bash scripts/rollback.sh
+  Deploy:    sudo bash scripts/deploy.sh   (optional; the timer checks every two minutes)
+  Logs:      $ROOT_DIR/logs/
+SUMMARY
 }
 
 main() {
   install_prerequisites
-  if [[ -d "$INSTALL_DIR/.git" ]] \
-    && [[ -n "$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=no)" ]]; then
-    die "Tracked local changes detected in $INSTALL_DIR"
-  fi
-  capture_previous_state
-  trap rollback_install ERR INT TERM EXIT
-  prepare_repository
+  load_deploy_config
+  validate_repository
   prepare_environment
-  start_bot
-  install_systemd_units
-  transaction_started=0
-  trap - ERR INT TERM EXIT
-  printf '\nLogs: cd %q && docker compose -p %q logs -f --tail=200\n' "$INSTALL_DIR" "$COMPOSE_PROJECT"
+  prepare_state_dir
+  open_log
+  acquire_lock 0 || die "Another deployment is running; try again in a minute"
+  recover_interrupted_release
+  adopt_running_release
+  migrate_legacy_state
+  release_commit "$(run_git rev-parse HEAD)" install
+  install_units || die "Could not install the systemd timers"
+  print_summary
 }
 
 main "$@"
