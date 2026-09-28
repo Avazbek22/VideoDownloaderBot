@@ -1,0 +1,11 @@
+[Unit]
+Description=Rebuild __APP_SLUG__ on its schedule
+
+[Timer]
+OnCalendar=__REBUILD_SCHEDULE__
+RandomizedDelaySec=30min
+Persistent=true
+Unit=__APP_SLUG__-rebuild.service
+
+[Install]
+WantedBy=timers.target

@@ -12,6 +12,8 @@ __pycache__
 venv
 data
 logs
+.deploy
+deploy.conf
 cookies*.txt
 tests
 *.md

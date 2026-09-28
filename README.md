@@ -104,11 +104,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Avazbek22/VideoDownloaderBot
 
 The installer will:
 
-* Install **Git**, **Docker**, Compose, and `flock` when needed
+* Install **Git**, **Docker**, Compose, `flock`, `curl`, and Python 3 when needed
 * Preserve an existing `.env`, `data/`, and `logs/`
 * Ask for **BOT_TOKEN** only when it is not configured
 * Build and validate the production image before replacing the container
 * Enable automatic deployment from `origin/main` and nightly yt-dlp image updates
+
+It clones the repository as your user and asks for `sudo` only for the
+installation itself. To install from an existing checkout, run
+`sudo bash install.sh` inside it; running it again later is safe and repairs
+the installation.
 
 > No Python knowledge required. One command on a fresh Ubuntu VPS.
 
@@ -139,11 +144,19 @@ Runtime logs are also written to `logs/bot.log`. Downloads use per-job directori
 
 ### Automatic deployment and rollback
 
-`videodownloaderbot-deploy.timer` checks `origin/main` every two minutes. Runtime changes are built and tested in a new image; documentation-only commits update the checkout without rebuilding the container. Before replacement, deployment verifies Python imports, ffmpeg, Node, yt-dlp, and Telegram `getMe`.
+`videodownloaderbot-deploy.timer` checks `origin/main` every two minutes and deploys a new commit once its GitHub checks pass (or after 30 minutes if CI never starts). A candidate image is built first; if it is identical to the running one — documentation or test changes — the checkout advances without a restart. Before replacement, deployment verifies Python imports, ffmpeg, ffprobe, Node, yt-dlp, and Telegram `getMe`.
 
-If build, preflight, container startup, or health stabilization fails, the previous Git commit and Docker image are restored. Changed systemd unit files are refreshed transactionally and restored too if deployment fails. The failed SHA is stored in `data/.failed-deploy-sha` and is not retried until a newer commit arrives. Daily deployment logs are stored in `logs/deploy-YYYY-MM-DD.log` for 60 days.
+If the build, those checks, container startup, or health stabilization fails, the previous commit and the exact image it ran are restored and the failed commit is skipped until a newer one arrives. For ten minutes after a release the timer keeps watching; a release that turns unhealthy or restarts is rolled back automatically. The bot counts as healthy only while its download workers run and Telegram answers its `getUpdates` requests.
 
-`videodownloaderbot-yt-dlp-update.timer` performs a nightly image rebuild using `YTDLP_CACHEBUST`. It never runs `pip install` inside the running container, does not pull a new base image, and does not restart the bot when yt-dlp is already current. If the expected local image tag is missing or stale, it can recover it only from the single healthy container with matching Compose labels. A changed update rolls back to the previous image if validation or startup fails. Updater logs are stored in `logs/updater-YYYY-MM-DD.log`.
+`videodownloaderbot-rebuild.timer` rebuilds the running commit every night with a fresh `REBUILD_STAMP`, which refreshes yt-dlp without touching the slower OS layers. The bot restarts only when `python -m yt_dlp --version` reports a new version, and a new version goes through the same checks and rollback. Both schedules live in [`deploy.conf`](deploy.conf).
+
+```bash
+sudo bash scripts/status.sh            # running release, previous release, pending work
+sudo bash scripts/deploy.sh --retry    # try a failed commit again
+sudo bash scripts/rollback.sh          # return to the previous release (run again to undo)
+```
+
+Deployment logs are stored in `logs/videodownloaderbot-deploy-YYYY-MM-DD.log` for 30 days.
 
 ---
 
@@ -267,7 +280,7 @@ docker compose up -d
 docker compose ps
 ```
 
-The container root filesystem is read-only. Only `data/`, `logs/`, and the in-memory `/tmp` filesystem are writable; Docker health is based on a fresh `/tmp/videodownloaderbot.healthy` heartbeat. Progress hooks stop a download when its actual byte count or reported total exceeds `MAX_FILESIZE`; `max_filesize` metadata checks alone are not treated as a hard streaming limit.
+The container root filesystem is read-only. Only `data/`, `logs/`, and the in-memory `/tmp` filesystem are writable; Docker health is based on a fresh `/tmp/videodownloaderbot.healthy` marker, which is refreshed only while the download workers run and Telegram answers `getUpdates`. Progress hooks stop a download when its actual byte count or reported total exceeds `MAX_FILESIZE`; `max_filesize` metadata checks alone are not treated as a hard streaming limit.
 
 ---
 
@@ -358,11 +371,12 @@ Then reconnect your SSH session.
 ```
 .
 ├── app/                     # Settings, planner, URL security, logging, helpers
-├── scripts/                 # Entrypoint, deploy, yt-dlp updater, systemd units
+├── scripts/                 # Entrypoint, deploy, rollback, status, systemd units
 ├── tests/                   # Python and rollback shell tests
 ├── main.py                  # Existing Telegram UX and application lifecycle
 ├── Dockerfile
 ├── docker-compose.yml
+├── deploy.conf              # Deployment and nightly rebuild settings
 ├── install.sh               # Idempotent production installer
 ├── .env-example
 ├── requirements.txt

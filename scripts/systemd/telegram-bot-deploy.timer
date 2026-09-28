@@ -1,0 +1,11 @@
+[Unit]
+Description=Check __APP_SLUG__ for new commits every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=20s
+Unit=__APP_SLUG__-deploy.service
+
+[Install]
+WantedBy=timers.target

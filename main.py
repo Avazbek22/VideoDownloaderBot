@@ -145,6 +145,12 @@ metadata_executor: ThreadPoolExecutor | None = None
 maintenance_finished = threading.Event()
 fatal_lifecycle_error = threading.Event()
 worker_failure_alerted = threading.Event()
+# Healthy also requires Telegram to have answered getUpdates recently, so a
+# revoked token, a network outage, or a second instance polling the same token
+# (HTTP 409) reports the container unhealthy and a fresh release rolls back.
+POLL_STALE_SECONDS = 90
+last_successful_poll = 0.0
+poll_stale = threading.Event()
 
 
 class JobCancelled(RuntimeError):
@@ -434,11 +440,7 @@ def _get_youtube_meta_for_client(
             if len(common_languages) == 1:
                 discovered_language = next(iter(common_languages))
                 matching_probe = next(
-                    (
-                        probe
-                        for language, probe, _languages in probes
-                        if _same_language(language, discovered_language)
-                    ),
+                    (probe for language, probe, _languages in probes if _same_language(language, discovered_language)),
                     None,
                 )
                 if matching_probe is None:
@@ -456,11 +458,15 @@ def _get_youtube_meta_for_client(
                     candidate = matching_probe
                     requested_language = discovered_language
             elif probes:
+
                 def probe_score(item: tuple[str, dict[str, Any], set[str]]) -> tuple[int, int, int, int]:
                     language, probe, probe_languages = item
                     available = _audio_languages(probe)
                     return (
-                        int(len(probe_languages) == 1 and any(_same_language(value, language) for value in probe_languages)),
+                        int(
+                            len(probe_languages) == 1
+                            and any(_same_language(value, language) for value in probe_languages)
+                        ),
                         int(any(_same_language(value, language) for value in available)),
                         int(any(_same_language(value, language) for value in probe_languages)),
                         -len(probe_languages),
@@ -1652,14 +1658,39 @@ def _heartbeat() -> bool:
                 except Exception:
                     LOGGER.exception("failed to stop polling after worker failure")
         return False
+    if time.monotonic() - last_successful_poll > POLL_STALE_SECONDS:
+        # Keep running: polling recovers on its own once Telegram answers again.
+        if not poll_stale.is_set():
+            poll_stale.set()
+            LOGGER.warning(
+                "Telegram getUpdates has not succeeded for %ss; reporting unhealthy",
+                POLL_STALE_SECONDS,
+            )
+        HEALTH_MARKER.unlink(missing_ok=True)
+        return True
+    if poll_stale.is_set():
+        poll_stale.clear()
+        LOGGER.info("Telegram getUpdates succeeds again; reporting healthy")
     HEALTH_MARKER.touch()
     return True
+
+
+def _record_successful_polls(instance: telebot.TeleBot) -> None:
+    get_updates = instance.get_updates
+
+    def get_updates_and_record(*args: Any, **kwargs: Any) -> Any:
+        global last_successful_poll
+        updates = get_updates(*args, **kwargs)
+        last_successful_poll = time.monotonic()
+        return updates
+
+    instance.get_updates = get_updates_and_record  # type: ignore[method-assign]
 
 
 def startup(settings: Settings) -> telebot.TeleBot:
     global SETTINGS, bot, WORKERS, PENDING_TTL_SEC, MAX_SEND_BYTES
     global YTDLP_CONCURRENT_FRAGMENTS, jobs_q, upload_slots, maintenance_thread
-    global metadata_slots, metadata_executor
+    global metadata_slots, metadata_executor, last_successful_poll
 
     HEALTH_MARKER.unlink(missing_ok=True)
     SETTINGS = settings
@@ -1678,6 +1709,10 @@ def startup(settings: Settings) -> telebot.TeleBot:
     bot = telebot.TeleBot(settings.token, threaded=True)
     register_handlers(bot)
     _preflight(settings, bot)
+    # getMe in the preflight proves the token and the network; polling keeps it fresh.
+    _record_successful_polls(bot)
+    last_successful_poll = time.monotonic()
+    poll_stale.clear()
     cleanup_stale_directories(settings.output_dir, settings.job_timeout_seconds * 2)
     metadata_executor = ThreadPoolExecutor(
         max_workers=settings.metadata_workers,

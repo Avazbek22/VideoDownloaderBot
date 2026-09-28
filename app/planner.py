@@ -411,9 +411,7 @@ def original_audio_language_candidates(meta: dict[str, Any]) -> list[str]:
             if not isinstance(tracks, list):
                 continue
             if any(
-                "original" in str(track.get("name") or "").casefold()
-                for track in tracks
-                if isinstance(track, dict)
+                "original" in str(track.get("name") or "").casefold() for track in tracks if isinstance(track, dict)
             ):
                 add(normalized)
     if candidates:
